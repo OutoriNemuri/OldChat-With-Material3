@@ -1,203 +1,133 @@
-# Operit Android 项目
+# OldChat With Material3
 
-这是一个基于 **Jetpack Compose** 的现代化 Android 应用开发模板。
+> **OldChat** 即时通讯软件的第三方客户端，使用 **Kotlin** + **Jetpack Compose** 从零重写，采用 **Material Design 3 (Material You)** 设计规范。
 
-## 🚀 项目特性
+[🌐 English](README.en.md) | [中文](README.md)
 
-✅ **Jetpack Compose** - 现代化声明式 UI 框架  
-✅ **Material Design 3** - 最新设计规范  
-✅ **Kotlin** - 100% Kotlin 编写  
-✅ **Gradle Version Catalog** - 统一依赖管理  
-✅ **开箱即用** - 包含完整项目结构  
+## ⚠️ 免责声明
+
+本项目是 OldChat 的**第三方非官方客户端**，与 OldChat 官方团队无关。使用本客户端可能违反官方服务条款，请自行承担风险。
+
+## ✨ 特性
+
+- 🎨 **Material You** —— 基于 Material Design 3 的动态取色与自适应外观
+- 💬 **即时消息** —— 私聊、群聊、阅后即焚、红包等完整消息能力
+- 🔒 **端到端加密** —— WebSocket 实时消息的 ECDH + AES-CBC + HMAC 加密会话协议
+- 📡 **双通道消息接收** —— WebSocket 实时推送 + HTTP 轮询兜底（5s 间隔）
+- 🕐 **打卡墙** —— 每日签到、Like/评论互动
+- 🎵 **音乐广场** —— 音乐上传、播放、下载、点赞
+- 💃 **表情广场** —— 表情包浏览与管理
+- 📱 **CIP 小程序** —— 基于 LuaJ 沙箱的轻量小程序运行环境
+- 🧠 **VibeCoding** —— OldChat AI / 自定义 OpenAI 兼容接口驱动的 AI 编程助手
+- ⚖️ **公开法庭** —— 社区举报与评议
+
+## 🏗️ 技术栈
+
+| 类别 | 技术 |
+|------|------|
+| 语言 | Kotlin 100% |
+| UI | Jetpack Compose + Material 3 |
+| 网络 | Ktor Client + OkHttp（WebSocket） |
+| 序列化 | Gson + kotlinx.serialization |
+| 加密 | ECDH (secp256r1) + AES-256-CBC + HMAC-SHA256 |
+| 本地存储 | DataStore Preferences |
+| 图片加载 | Coil |
+| 音视频 | Media3 (ExoPlayer) |
+| 小程序 | LuaJ (Lua 沙箱) |
+| 构建 | Gradle Version Catalog |
 
 ## 📁 项目结构
 
 ```
-android-project/
-├── app/
-│   ├── src/
-│   │   ├── main/
-│   │   │   ├── java/com/java/myapplication/
-│   │   │   │   ├── MainActivity.kt          # 主Activity
-│   │   │   │   └── ui/theme/
-│   │   │   │       ├── Color.kt             # 颜色定义
-│   │   │   │       ├── Theme.kt             # 主题配置
-│   │   │   │       └── Type.kt              # 字体配置
-│   │   │   ├── res/                         # 资源文件
-│   │   │   └── AndroidManifest.xml          # 应用清单
-│   │   ├── androidTest/                     # Android测试
-│   │   └── test/                            # 单元测试
-│   ├── build.gradle.kts                     # App模块配置
-│   └── proguard-rules.pro                   # 混淆规则
-├── gradle/
-│   ├── libs.versions.toml                   # 依赖版本管理
-│   └── wrapper/                             # Gradle Wrapper
-├── build.gradle.kts                         # 项目级配置
-├── settings.gradle.kts                      # 项目设置
-├── gradle.properties                        # Gradle属性
-├── gradlew / gradlew.bat                    # Gradle命令
-└── .gitignore                               # Git忽略
+app/src/main/java/com/oldchat/material/
+├── core/
+│   ├── network/        # ApiClient / WebSocketManager / MessageReceiver
+│   ├── auth/           # 认证与会话管理
+│   ├── crypto/         # ECDH / AES / HMAC 加密工具
+│   ├── model/          # 数据模型（Gson 实体）
+│   ├── cache/          # 本地缓存（好友/群/聊天记录等）
+│   └── media/          # 媒体上传
+├── feature/
+│   ├── auth/           # 登录 / 注册
+│   ├── home/           # 会话列表 / 通知
+│   ├── chat/           # 私聊 / 群聊 / 红包
+│   ├── discover/       # 打卡墙 / 音乐广场 / 表情 / CIP / VibeCoding / 法庭
+│   ├── cip/            # CIP 小程序
+│   └── settings/       # 设置 / 反馈
+├── service/            # 前台服务（消息保活）
+├── ui/                 # 主题 / 通用组件
+├── MainActivity.kt
+└── OldChatApplication.kt
 ```
 
-## 🛠️ 快速开始
+## 🛠️ 环境要求
 
-### 1. 环境要求
-- ✅ **JDK 17+**（必需）
-- ✅ **Gradle** (已包含 Wrapper)
-- ✅ **Android SDK** (可选，用于完整编译)
+- **JDK 17+**
+- **Android SDK**（compileSdk 35）
+- **Gradle**（已附带 Wrapper）
 
-### 2. 构建项目
+## 🚀 构建
 
-#### 使用 Operit 内置命令按钮
-- 🔧 **初始化 Gradle Wrapper** - 首次使用
-- 🔨 **构建项目** - 编译整个项目
-- 🧹 **清理构建** - 清理构建缓存
-- 📋 **查看所有任务** - 列出可用任务
-
-#### 命令行方式
 ```bash
-# Linux/Mac
-./gradlew build              # 构建项目
-./gradlew assembleDebug      # 打包Debug APK
-./gradlew installDebug       # 安装到设备
-./gradlew clean              # 清理构建
+# Debug 构建
+./gradlew assembleDebug
 
-# Windows
-gradlew.bat build
-gradlew.bat assembleDebug
+# Release 构建（需先配置签名，见下文）
+./gradlew assembleRelease
 ```
 
-### 3. 生成的APK位置
+生成的 APK 位于：
+
 ```
 app/build/outputs/apk/debug/app-debug.apk
+app/build/outputs/apk/release/app-release.apk
 ```
+
+## 🔑 Release 签名
+
+Release 构建需要配置签名密钥。在 `keystore.properties` 中填入密钥信息（该文件已被 `.gitignore` 排除，不会入库）：
+
+```properties
+storeFile=../release/your-key.jks
+storePassword=你的store密码
+keyAlias=你的key别名
+keyPassword=你的key密码
+```
+
+然后在 `app/build.gradle.kts` 中取消 `signingConfig` 的注释即可。
+
+> ⚠️ **切勿**将 `.jks` / `.keystore` 文件提交到仓库，密钥泄露会导致无法给后续版本升级签名。
 
 ## 📦 依赖管理
 
-项目使用 **Gradle Version Catalog** 统一管理依赖版本。
+项目使用 **Gradle Version Catalog** 统一管理依赖，定义在 `gradle/libs.versions.toml`。
 
-### 查看当前依赖
-在 `gradle/libs.versions.toml` 中定义：
+添加新依赖：
 
 ```toml
-[versions]
-agp = "9.0.0"
-kotlin = "2.3.10"
-composeBom = "2026.01.01"
-
+# libs.versions.toml
 [libraries]
-androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
-androidx-compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
+your-lib = { group = "com.example", name = "your-lib", version = "1.0.0" }
 ```
-
-### 添加新依赖
-1. 在 `gradle/libs.versions.toml` 中添加版本和库定义
-2. 在 `app/build.gradle.kts` 中引用：
-   ```kotlin
-   dependencies {
-       implementation(libs.your.library.name)
-   }
-   ```
-
-## 🎨 自定义应用
-
-### 修改应用名称
-编辑 `app/src/main/res/values/strings.xml`：
-```xml
-<string name="app_name">你的应用名</string>
-```
-
-### 修改包名
-1. 更新 `app/build.gradle.kts` 中的 `namespace` 和 `applicationId`
-2. 重命名 `java/com/java/myapplication` 目录结构
-3. 更新 `AndroidManifest.xml` 中的包名引用
-
-### 修改主题颜色
-编辑 `app/src/main/java/.../ui/theme/Color.kt`：
-```kotlin
-val Purple80 = Color(0xFFD0BCFF)  // 修改为你的颜色
-```
-
-## 📱 Compose 示例
-
-当前 `MainActivity.kt` 包含一个简单的 Greeting 示例：
 
 ```kotlin
-@Composable
-fun Greeting(name: String, modifier: Modifier = Modifier) {
-    Text(
-        text = "Hello $name!",
-        modifier = modifier
-    )
+// app/build.gradle.kts
+dependencies {
+    implementation(libs.your.lib)
 }
 ```
 
-你可以：
-- 添加更多 Composable 函数
-- 使用 Material3 组件
-- 实现导航（推荐使用 Navigation Compose）
-- 集成 ViewModel、Repository 等架构组件
+## 🤝 贡献
 
-## 🔧 常用 Gradle 任务
+欢迎提交 Issue 和 Pull Request。
 
-```bash
-./gradlew tasks              # 查看所有可用任务
-./gradlew clean              # 清理构建
-./gradlew build              # 完整构建
-./gradlew assembleDebug      # 构建Debug APK
-./gradlew assembleRelease    # 构建Release APK
-./gradlew installDebug       # 安装Debug到设备
-./gradlew test               # 运行单元测试
-./gradlew connectedAndroidTest # 运行Android测试
-```
+- **反馈问题** → [GitHub Issues](https://github.com/OutoriNemuri/OldChat-With-Material3/issues)
+- **提交代码** → 请先 Fork 再发起 Pull Request
 
-## 📝 注意事项
+## 📄 许可证
 
-⚠️ **关于 Android SDK**  
-- 此模板可以在 Operit 的 Ubuntu 环境中构建
-- 完整编译需要安装 Android SDK
-- 推荐使用 Android Studio 进行完整开发
+本项目基于 **GNU General Public License v3.0** 开源，详见 [LICENSE](LICENSE)。
 
-### ⚠️ ARM64 环境 AAPT2 替换（模板已内置）
+## 🙏 致谢
 
-Gradle 会自动从 Google Maven 下载 AAPT2，但官方分发在 ARM64 Linux 环境下不可直接使用。
-此模板已经内置 ARM64 `aapt2`，`setup_android_env.sh` 会自动把它替换到 SDK build-tools 和 Gradle 缓存里。
-
-**模板内置来源**：
-- Release: https://github.com/ReVanced/aapt2/releases/tag/v1.0.0
-- ARM64 aapt2: https://github.com/ReVanced/aapt2/releases/download/v1.0.0/aapt2-arm64-v8a
-- SHA-256: `e5b5ff7f0d4f6ecd7fa5d05d77fed3f09f6f1bf80f078b8aada82bc578848561`
-
-**你只需要执行**
-```bash
-chmod +x ./setup_android_env.sh
-./setup_android_env.sh
-```
-
-脚本会自动完成：
-- 替换 `$ANDROID_SDK/build-tools/35.0.0/aapt2`
-- 替换 `~/.gradle/caches/modules-2/files-2.1/com.android.tools.build/aapt2` 下的 jar 内二进制
-- 替换 `~/.gradle/caches/transforms-*` 中已经解压出来的 `aapt2`
-
-⚠️ **关于包名**  
-- 默认包名为 `com.java.myapplication`
-- 发布前请修改为你的唯一包名
-
-⚠️ **关于签名**  
-- Debug 版本自动使用调试签名
-- Release 版本需要配置签名密钥
-
-## 🌐 相关资源
-
-- [Jetpack Compose 官方文档](https://developer.android.com/jetpack/compose)
-- [Material Design 3](https://m3.material.io/)
-- [Android 开发者指南](https://developer.android.com/)
-- [Kotlin 官方文档](https://kotlinlang.org/)
-
-## 💡 提示
-
-- 使用 `./gradlew --scan` 可以查看详细的构建分析
-- 使用 `./gradlew build --info` 查看详细构建日志
-- 修改 `gradle.properties` 可以调整构建性能
-
-Happy Coding! 🤖✨
+- [OldChat-For-Windows](https://github.com/Coloryi-MIAO/OldChat-For-Windows)（MIT License）—— WebSocket 加密会话协议参考实现

@@ -1,200 +1,133 @@
 # OldChat With Material3
 
-A modern Android client for the OldChat messenger, rewritten in **Kotlin** with **Jetpack Compose** and **Material Design 3**.
+> A third-party client for the **OldChat** instant messenger, rewritten from scratch in **Kotlin** + **Jetpack Compose** with **Material Design 3 (Material You)**.
 
-## 🚀 Features
+[🌐 English](README.en.md) | [中文](README.md)
 
-✅ **Jetpack Compose** — modern declarative UI framework
-✅ **Material Design 3** — latest design guidelines (Material You)
-✅ **Kotlin** — 100% Kotlin
-✅ **Gradle Version Catalog** — unified dependency management
-✅ **Ready to run** — complete project structure included
+## ⚠️ Disclaimer
+
+This project is a **third-party, unofficial client** for OldChat and is not affiliated with the official OldChat team. Using this client may violate the official Terms of Service; use it at your own risk.
+
+## ✨ Features
+
+- 🎨 **Material You** — dynamic color and adaptive theming based on Material Design 3
+- 💬 **Instant messaging** — direct messages, group chats, self-destructing messages, red packets, and more
+- 🔒 **End-to-end encryption** — ECDH + AES-CBC + HMAC encrypted session protocol for WebSocket real-time messages
+- 📡 **Dual-channel message reception** — WebSocket real-time push + HTTP polling fallback (5s interval)
+- 🕐 **Check-in wall** — daily check-ins with like/comment interactions
+- 🎵 **Music plaza** — upload, play, download, and like music
+- 💃 **Emoji plaza** — browse and manage stickers
+- 📱 **CIP mini-apps** — a lightweight mini-app runtime built on the LuaJ sandbox
+- 🧠 **VibeCoding** — an AI coding assistant powered by OldChat AI or a custom OpenAI-compatible API
+- ⚖️ **Public court** — community reporting and review
+
+## 🏗️ Tech Stack
+
+| Category | Technology |
+|----------|------------|
+| Language | Kotlin 100% |
+| UI | Jetpack Compose + Material 3 |
+| Networking | Ktor Client + OkHttp (WebSocket) |
+| Serialization | Gson + kotlinx.serialization |
+| Cryptography | ECDH (secp256r1) + AES-256-CBC + HMAC-SHA256 |
+| Local storage | DataStore Preferences |
+| Image loading | Coil |
+| Audio/Video | Media3 (ExoPlayer) |
+| Mini-apps | LuaJ (Lua sandbox) |
+| Build | Gradle Version Catalog |
 
 ## 📁 Project Structure
 
 ```
-android-project/
-├── app/
-│   ├── src/
-│   │   ├── main/
-│   │   │   ├── java/com/oldchat/material/
-│   │   │   │   ├── MainActivity.kt          # Main activity
-│   │   │   │   └── ui/theme/
-│   │   │   │       ├── Color.kt             # Color definitions
-│   │   │   │       ├── Theme.kt             # Theme configuration
-│   │   │   │       └── Type.kt              # Typography configuration
-│   │   │   ├── res/                         # Resources
-│   │   │   └── AndroidManifest.xml          # App manifest
-│   │   ├── androidTest/                     # Instrumented tests
-│   │   └── test/                            # Unit tests
-│   ├── build.gradle.kts                     # App module configuration
-│   └── proguard-rules.pro                   # ProGuard rules
-├── gradle/
-│   ├── libs.versions.toml                   # Dependency version management
-│   └── wrapper/                             # Gradle Wrapper
-├── build.gradle.kts                         # Project-level configuration
-├── settings.gradle.kts                      # Project settings
-├── gradle.properties                        # Gradle properties
-├── gradlew / gradlew.bat                    # Gradle commands
-└── .gitignore                               # Git ignore rules
+app/src/main/java/com/oldchat/material/
+├── core/
+│   ├── network/        # ApiClient / WebSocketManager / MessageReceiver
+│   ├── auth/           # Authentication & session management
+│   ├── crypto/         # ECDH / AES / HMAC crypto utilities
+│   ├── model/          # Data models (Gson entities)
+│   ├── cache/          # Local caches (friends / groups / chat history, etc.)
+│   └── media/          # Media upload
+├── feature/
+│   ├── auth/           # Login / registration
+│   ├── home/           # Conversation list / notifications
+│   ├── chat/           # Direct / group chat / red packets
+│   ├── discover/       # Check-in wall / music plaza / emoji / CIP / VibeCoding / court
+│   ├── cip/            # CIP mini-apps
+│   └── settings/       # Settings / feedback
+├── service/            # Foreground service (message keep-alive)
+├── ui/                 # Theme / shared components
+├── MainActivity.kt
+└── OldChatApplication.kt
 ```
 
-## 🛠️ Getting Started
+## 🛠️ Requirements
 
-### 1. Requirements
-- ✅ **JDK 17+** (required)
-- ✅ **Gradle** (Wrapper is included)
-- ✅ **Android SDK** (optional, for full builds)
+- **JDK 17+**
+- **Android SDK** (compileSdk 35)
+- **Gradle** (Wrapper included)
 
-### 2. Build the Project
+## 🚀 Build
 
-#### Command line
 ```bash
-# Linux/macOS
-./gradlew build              # Build the project
-./gradlew assembleDebug      # Build the debug APK
-./gradlew installDebug       # Install to a device
-./gradlew clean              # Clean the build
+# Debug build
+./gradlew assembleDebug
 
-# Windows
-gradlew.bat build
-gradlew.bat assembleDebug
+# Release build (requires signing configuration, see below)
+./gradlew assembleRelease
 ```
 
-### 3. Output APK location
+Output APKs are located at:
+
 ```
 app/build/outputs/apk/debug/app-debug.apk
+app/build/outputs/apk/release/app-release.apk
 ```
+
+## 🔑 Release Signing
+
+Release builds require a signing key. Fill in your key info in `keystore.properties` (this file is excluded by `.gitignore` and never committed):
+
+```properties
+storeFile=../release/your-key.jks
+storePassword=yourStorePassword
+keyAlias=yourKeyAlias
+keyPassword=yourKeyPassword
+```
+
+Then uncomment the `signingConfig` line in `app/build.gradle.kts`.
+
+> ⚠️ **Never** commit `.jks` / `.keystore` files to the repository — leaking your key would prevent you from signing future version upgrades.
 
 ## 📦 Dependency Management
 
-This project uses the **Gradle Version Catalog** for unified dependency management.
+This project uses the **Gradle Version Catalog**, defined in `gradle/libs.versions.toml`.
 
-### Viewing current dependencies
-Defined in `gradle/libs.versions.toml`:
+To add a new dependency:
 
 ```toml
-[versions]
-agp = "9.0.0"
-kotlin = "2.3.10"
-composeBom = "2026.01.01"
-
+# libs.versions.toml
 [libraries]
-androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
-androidx-compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
+your-lib = { group = "com.example", name = "your-lib", version = "1.0.0" }
 ```
-
-### Adding a new dependency
-1. Add the version and library definition to `gradle/libs.versions.toml`
-2. Reference it in `app/build.gradle.kts`:
-   ```kotlin
-   dependencies {
-       implementation(libs.your.library.name)
-   }
-   ```
-
-## 🎨 Customizing the App
-
-### Changing the app name
-Edit `app/src/main/res/values/strings.xml`:
-```xml
-<string name="app_name">Your App Name</string>
-```
-
-### Changing the package name
-1. Update `namespace` and `applicationId` in `app/build.gradle.kts`
-2. Rename the `java/com/oldchat/material` directory structure
-3. Update package references in `AndroidManifest.xml`
-
-### Changing theme colors
-Edit `app/src/main/java/.../ui/theme/Color.kt`:
-```kotlin
-val Purple80 = Color(0xFFD0BCFF)  // Replace with your color
-```
-
-## 📱 Compose Example
-
-`MainActivity.kt` includes a simple `Greeting` example:
 
 ```kotlin
-@Composable
-fun Greeting(name: String, modifier: Modifier = Modifier) {
-    Text(
-        text = "Hello $name!",
-        modifier = modifier
-    )
+// app/build.gradle.kts
+dependencies {
+    implementation(libs.your.lib)
 }
 ```
 
-You can:
-- Add more composable functions
-- Use Material3 components
-- Implement navigation (Navigation Compose is recommended)
-- Integrate ViewModel, Repository and other architecture components
+## 🤝 Contributing
 
-## 🔧 Common Gradle Tasks
+Issues and pull requests are welcome.
 
-```bash
-./gradlew tasks              # List all available tasks
-./gradlew clean              # Clean the build
-./gradlew build              # Full build
-./gradlew assembleDebug      # Build debug APK
-./gradlew assembleRelease    # Build release APK
-./gradlew installDebug       # Install debug build to device
-./gradlew test               # Run unit tests
-./gradlew connectedAndroidTest # Run instrumented tests
-```
-
-## 📝 Notes
-
-⚠️ **About the Android SDK**
-- This template can be built in Operit's Ubuntu environment
-- Full compilation requires the Android SDK
-- Android Studio is recommended for full development
-
-### ⚠️ ARM64 AAPT2 replacement (built into the template)
-
-Gradle automatically downloads AAPT2 from Google Maven, but the official
-distribution does not run directly on ARM64 Linux. This template bundles an
-ARM64 `aapt2`; `setup_android_env.sh` replaces it into the SDK build-tools and
-Gradle caches automatically.
-
-**Bundled source**:
-- Release: https://github.com/ReVanced/aapt2/releases/tag/v1.0.0
-- ARM64 aapt2: https://github.com/ReVanced/aapt2/releases/download/v1.0.0/aapt2-arm64-v8a
-- SHA-256: `e5b5ff7f0d4f6ecd7fa5d05d77fed3f09f6f1bf80f078b8aada82bc578848561`
-
-**All you need to do**
-```bash
-chmod +x ./setup_android_env.sh
-./setup_android_env.sh
-```
-
-The script automatically:
-- Replaces `$ANDROID_SDK/build-tools/35.0.0/aapt2`
-- Replaces the binary inside `~/.gradle/caches/modules-2/files-2.1/com.android.tools.build/aapt2`
-- Replaces the already-extracted `aapt2` under `~/.gradle/caches/transforms-*`
-
-⚠️ **About signing**
-- Debug builds use the debug signing key automatically
-- Release builds require a configured signing key
-
-## 🌐 Resources
-
-- [Jetpack Compose documentation](https://developer.android.com/jetpack/compose)
-- [Material Design 3](https://m3.material.io/)
-- [Android developer guide](https://developer.android.com/)
-- [Kotlin documentation](https://kotlinlang.org/)
-
-## 💡 Tips
-
-- Use `./gradlew --scan` for detailed build analysis
-- Use `./gradlew build --info` for verbose build logs
-- Tune `gradle.properties` to adjust build performance
+- **Report bugs** → [GitHub Issues](https://github.com/OutoriNemuri/OldChat-With-Material3/issues)
+- **Submit code** → fork the repo and open a pull request
 
 ## 📄 License
 
-This project is licensed under the **GNU General Public License v3.0**. See the
-[LICENSE](LICENSE) file for the full text.
+This project is open-sourced under the **GNU General Public License v3.0**. See [LICENSE](LICENSE).
 
-Happy Coding! 🤖✨
+## 🙏 Acknowledgments
+
+- [OldChat-For-Windows](https://github.com/Coloryi-MIAO/OldChat-For-Windows) (MIT License) — reference implementation for the WebSocket encrypted session protocol
