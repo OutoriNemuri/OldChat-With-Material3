@@ -1,0 +1,31 @@
+# ---- Android ----
+*.iml
+.gradle
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+build/
+**/build/
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+*.class
+
+# ---- Kotlin / 编译缓存 ----
+.kotlin/
+
+# ---- 工具脚本（Python 实测脚本，不入库） ----
+/tools/
+
+# ---- Operit 平台 / 备份（非项目源码） ----
+.operit/
+.backup/
+
+# ---- 环境搭建脚本（非项目源码） ----
+/setup_android_env.sh

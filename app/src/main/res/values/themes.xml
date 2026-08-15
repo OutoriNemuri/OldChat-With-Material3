@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!-- 品牌背景色（Compose 首帧前显示，避免白屏闪烁） -->
+    <color name="splash_background">#FF6200EE</color>
+
+    <style name="Theme.MyApplication" parent="android:Theme.Material.Light.NoActionBar">
+        <!-- 启动阶段窗口背景：用品牌色代替默认白色，消除启动白屏 -->
+        <item name="android:windowBackground">@color/splash_background</item>
+        <!-- 状态栏/导航栏着色，保持与窗口背景一致，避免启动瞬间的色差 -->
+        <item name="android:statusBarColor">@color/splash_background</item>
+        <item name="android:navigationBarColor">@color/splash_background</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <!-- 关闭窗口预览/动画期间的闪烁 -->
+        <item name="android:windowDisablePreview">false</item>
+    </style>
+</resources>
