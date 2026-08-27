@@ -1,0 +1,71 @@
+name: "App 崩溃或异常"
+description: "OldChat 出现闪退、卡死或功能异常"
+labels: [bug, 待处理]
+body:
+- type: checkboxes
+  id: check
+  attributes:
+    label: "提交前自查"
+    description: "请逐项确认，减少无效反馈"
+    options:
+    - label: "我已更新到 **最新版本**，问题依然存在"
+      required: true
+    - label: "我已在 Issues 中搜索，确认没有重复提交过此问题"
+      required: true
+    - label: "此问题在官方 Demo 中也能复现（如果是 API 相关）"
+      required: false
+
+- type: textarea
+  id: description
+  attributes:
+    label: "问题描述"
+    description: "请清晰描述发生了什么"
+    placeholder: "例如：点击发送按钮后，App 闪退到桌面..."
+  validations:
+    required: true
+
+- type: textarea
+  id: reproduce
+  attributes:
+    label: "复现步骤"
+    description: "如何一步步触发这个问题"
+    placeholder: |
+      1. 打开 OldChat
+      2. 输入任意文本
+      3. 点击发送
+      4. 闪退
+  validations:
+    required: true
+
+- type: textarea
+  id: log
+  attributes:
+    label: "日志文件（如有）"
+    description: "将崩溃日志或 logcat 输出拖拽到这里"
+    placeholder: "点击此处，然后将文件拖拽进来"
+  validations:
+    required: false
+
+- type: input
+  id: device
+  attributes:
+    label: "设备型号"
+    placeholder: "例如：小米 14 Pro"
+  validations:
+    required: true
+
+- type: input
+  id: android
+  attributes:
+    label: "Android 版本"
+    placeholder: "例如：Android 15"
+  validations:
+    required: true
+
+- type: input
+  id: version
+  attributes:
+    label: "OldChat 版本"
+    placeholder: "例如：v1.0.0"
+  validations:
+    required: true
