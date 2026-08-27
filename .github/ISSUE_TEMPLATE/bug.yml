@@ -1,19 +1,19 @@
 name: "App 崩溃或异常"
 description: "OldChat 出现闪退、卡死或功能异常"
-labels: [bug, 待处理]
+labels: [bug, 新反馈]
 body:
 - type: checkboxes
   id: check
   attributes:
-    label: "提交前自查"
-    description: "请逐项确认，减少无效反馈"
+    label: "检查项"
+    description: "请逐一检查每一项。"
     options:
-    - label: "我已更新到 **最新版本**，问题依然存在"
+    - label: "我已更新到 **最新版本**，问题依然存在。"
       required: true
     - label: "我已在 Issues 中搜索，确认没有重复提交过此问题"
       required: true
-    - label: "此问题在官方 Demo 中也能复现（如果是 API 相关）"
-      required: false
+    - label: "此问题在官方客户端中不会出现。如果问题在官方客户端中复现，说明该问题并非OldChat Material所致，请*不要*提交Issues。"
+      required: true
 
 - type: textarea
   id: description
@@ -65,7 +65,7 @@ body:
 - type: input
   id: version
   attributes:
-    label: "OldChat 版本"
-    placeholder: "例如：v1.0.0"
+    label: "OldChat Material版本"
+    placeholder: "例如：v2.3.2（Build 3）"
   validations:
     required: true
