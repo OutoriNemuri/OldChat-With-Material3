@@ -1,3 +1,7 @@
+// 注意：Kotlin DSL 脚本里 `java` 会被 Gradle 的 java 扩展遮蔽，
+// 所以必须 import 后才能用 Properties（否则 java.util.Properties 报 Unresolved reference）。
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
@@ -25,7 +29,7 @@ android {
     // 根本装不上。现在读取根目录 keystore.properties（不进版本库），
     // 没配置时给出明确提示而不是静默出一个装不上的包。
     val keystorePropsFile = rootProject.file("keystore.properties")
-    val keystoreProps = java.util.Properties().apply {
+    val keystoreProps = Properties().apply {
         if (keystorePropsFile.exists()) keystorePropsFile.inputStream().use { load(it) }
     }
 
