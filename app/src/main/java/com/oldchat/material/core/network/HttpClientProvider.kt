@@ -48,10 +48,15 @@ object HttpClientProvider {
             }
         }
 
+        // BUG-15：这个 client 只用于 WebSocket（REST 走 Ktor）。
+        // 原来给了 readTimeout(30s) 且没有 pingInterval → 空闲 30s 就被 OkHttp 判定读超时断开，
+        // 于是「挂后台几分钟就掉线」。WS 需要 readTimeout=0（不超时）+ 25s 心跳保活。
         okHttpClient = OkHttpClient.Builder()
             .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(0, TimeUnit.MILLISECONDS)
             .writeTimeout(30, TimeUnit.SECONDS)
+            .pingInterval(25, TimeUnit.SECONDS)
+            .retryOnConnectionFailure(true)
             .build()
     }
 }

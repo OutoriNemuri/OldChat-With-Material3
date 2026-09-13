@@ -164,11 +164,20 @@ fun VibeCodingScreen(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                             Spacer(Modifier.height(24.dp))
-                            // Tools chip display
+                            // BUG-22：这些工具只是「展示用」——请求体里从来没有 tools，
+                            // 引擎也不会真的执行文件读写/命令。原来渲染成可点击的 AssistChip
+                            // 但 onClick 是空的，属于误导。改成静态标签并明确标注未实现。
+                            Text(
+                                "可用工具（当前仅展示，尚未接入工具调用）",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Spacer(Modifier.height(6.dp))
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 vibeViewModel.tools.forEach { tool ->
                                     AssistChip(
                                         onClick = { },
+                                        enabled = false,
                                         label = { Text(tool, style = MaterialTheme.typography.labelSmall) }
                                     )
                                 }

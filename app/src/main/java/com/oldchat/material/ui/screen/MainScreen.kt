@@ -23,6 +23,7 @@ import com.oldchat.material.feature.chat.GroupChatScreen
 import com.oldchat.material.feature.discover.CheckinScreen
 import com.oldchat.material.feature.discover.CipCenterScreen
 import com.oldchat.material.feature.discover.DiscoverScreen
+import com.oldchat.material.feature.discover.DiscoverSettingsScreen
 import com.oldchat.material.feature.discover.EmojiPlazaScreen
 import com.oldchat.material.feature.discover.FeedScreen
 import com.oldchat.material.feature.discover.MusicSquareScreen
@@ -247,6 +248,7 @@ fun MainScreen(
                         label = "discover_nav"
                     ) { route ->
                         when (route) {
+                            "discover_settings" -> DiscoverSettingsScreen(onBack = { discoverRoute = null })
                             null -> DiscoverScreen(
                                 modifier = Modifier.padding(innerPadding),
                                 onNavigate = { discoverRoute = it }

@@ -92,7 +92,9 @@ class MessageService : Service() {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("OldChat Material")
             .setContentText("正在运行…")
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            // BUG-09：原来用 android.R.drawable.ic_dialog_info（系统内部资源，
+            // 部分 ROM 上会渲染成空白方块），改用自带单色矢量图标
+            .setSmallIcon(com.oldchat.material.R.drawable.ic_stat_oldchat)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setContentIntent(pendingIntent)

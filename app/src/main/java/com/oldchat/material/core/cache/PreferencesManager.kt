@@ -30,13 +30,7 @@ class PreferencesManager(internal val context: Context) {
 
     // ---- Server Settings ----
 
-    val serverBaseUrl: Flow<String> = context.dataStore.data.map { prefs ->
-        prefs[KEY_SERVER_BASE_URL] ?: ""
-    }
 
-    suspend fun setServerBaseUrl(url: String) {
-        context.dataStore.edit { prefs -> prefs[KEY_SERVER_BASE_URL] = url }
-    }
 
     // ---- Appearance ----
 

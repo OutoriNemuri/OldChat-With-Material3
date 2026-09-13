@@ -46,7 +46,9 @@ fun ChatsScreen(
 ) {
     val recentChats by homeViewModel.recentChats.collectAsStateWithLifecycle()
     val connectionState by homeViewModel.connectionState.collectAsStateWithLifecycle()
-    val showNews by remember { mutableStateOf(true) } // TODO: load from settings
+    // BUG-08：原来写死 true 并挂着 TODO —— 设置里的「首页显示新闻区」开关完全无效。
+    val showNews by com.oldchat.material.OldChatApplication.instance.cacheManager.preferences
+        .showNewsSection.collectAsStateWithLifecycle(initialValue = true)
 
     // 会话列表按最近消息时间降序排列（最新消息的会话排在最上）
     val sortedChats by remember(recentChats) {

@@ -60,12 +60,24 @@ class AuthManager(
     /**
      * Called on login success. Stores tokens and increments generation.
      */
+    /**
+     * ALIGN-18：账号切换回调。登录成功且 uid 与上次不同 → 需要清掉上一个账号的本地数据，
+     * 否则新账号会看到旧账号的会话列表/消息/页面缓存。
+     */
+    var onAccountSwitched: (() -> Unit)? = null
+
     fun onLoginSuccess(accessToken: String, refreshToken: String, userId: String, uid: String) {
+        val previousUid = this.myUid
         this.accessToken = accessToken
         this.refreshToken = refreshToken
         this.userId = userId
         this.myUid = uid
         authGeneration++
+        clearSession()
+
+        if (!previousUid.isNullOrEmpty() && previousUid != uid) {
+            onAccountSwitched?.invoke()
+        }
     }
 
     /**

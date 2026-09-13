@@ -82,7 +82,7 @@ fun CipDeveloperScreen(
                 LazyColumn(
                     contentPadding = PaddingValues(8.dp)
                 ) {
-                    items(fileTree) { file ->
+                    items(fileTree, key = { it }) { file ->
                         Text(
                             file,
                             modifier = Modifier

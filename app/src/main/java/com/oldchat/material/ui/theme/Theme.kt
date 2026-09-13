@@ -106,6 +106,9 @@ fun OldChatMaterialTheme(
     val context = LocalContext.current
     val preferences = com.oldchat.material.OldChatApplication.instance.cacheManager.preferences
     val isDarkPref by preferences.isDarkMode.collectAsState(initial = darkTheme)
+    // BUG-08：原来动态取色只是函数默认参数，设置里的开关写了 DataStore 但没人读 →
+    // 开关完全无效。这里真正接上线。
+    val dynamicColorPref by preferences.useDynamicColor.collectAsState(initial = true)
 
     // Read DPI scales from DataStore
     val dpiManager = remember { DpiManager(preferences) }
@@ -113,7 +116,7 @@ fun OldChatMaterialTheme(
     val displayScale by dpiManager.displayScale.collectAsState(initial = DpiManager.DEFAULT_SCALE)
 
     val colorScheme = when {
-        dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
+        (dynamicColor && dynamicColorPref) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
             if (isDarkPref) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
         }
         isDarkPref -> DarkColorScheme

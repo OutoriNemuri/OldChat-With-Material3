@@ -30,11 +30,17 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import com.oldchat.material.core.notify.AppForeground
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
 import com.oldchat.material.core.model.Message
 import com.oldchat.material.core.model.MessagePayloadBuilder
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.distinctUntilChanged
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 
@@ -54,6 +60,7 @@ fun ChatScreen(
 ) {
     val messages by chatViewModel.messages.collectAsStateWithLifecycle()
     val myAvatarUrl by chatViewModel.myAvatarUrl.collectAsStateWithLifecycle()
+    val isPeerTyping by chatViewModel.isPeerTyping.collectAsStateWithLifecycle()
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
@@ -123,10 +130,27 @@ fun ChatScreen(
             scrollInitDone = true
         }
     }
-    // 后续新增消息（发送/接收）时滚到底部
+    // BUG-05：新增消息时不再「无条件」把视图拽到底部——
+    // 原来只要有人发消息，正在翻历史的用户就会被强制弹回底部。
+    // 现在的规则：用户本来就在底部附近、或这条消息是自己发的，才自动滚到底；
+    // 否则只累计「新消息」计数，显示浮标由用户决定何时跳。
+    var pendingNewMessages by remember { mutableStateOf(0) }
+    val isNearBottom by remember {
+        derivedStateOf {
+            val info = listState.layoutInfo
+            val last = info.visibleItemsInfo.lastOrNull()
+            last == null || last.index >= info.totalItemsCount - 2
+        }
+    }
+
     LaunchedEffect(messages.size) {
-        if (scrollInitDone && messages.isNotEmpty()) {
+        if (!scrollInitDone || messages.isEmpty()) return@LaunchedEffect
+        val newestIsMine = messages.lastOrNull()?.let { chatViewModel.isOwnMessage(it) } == true
+        if (isNearBottom || newestIsMine) {
             listState.scrollToItem(messages.size)
+            pendingNewMessages = 0
+        } else {
+            pendingNewMessages += 1
         }
     }
 
@@ -136,7 +160,16 @@ fun ChatScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text(friendName, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                title = {
+                    // ALIGN-15：对方输入中时把标题换成提示
+                    if (isPeerTyping) {
+                        Text("正在输入…", maxLines = 1,
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.primary)
+                    } else {
+                        Text(friendName, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.Filled.ArrowBack, "返回")
@@ -213,7 +246,11 @@ fun ChatScreen(
                         }
                         OutlinedTextField(
                             value = inputText,
-                            onValueChange = { inputText = it },
+                            onValueChange = {
+                                inputText = it
+                                // ALIGN-15：把「正在输入」同步给对方（内部有节流）
+                                chatViewModel.onInputChanged(it)
+                            },
                             modifier = Modifier.weight(1f),
                             placeholder = { Text("输入消息…") },
                             maxLines = 4,
@@ -236,6 +273,7 @@ fun ChatScreen(
             }
         }
     ) { padding ->
+        Box(modifier = Modifier.fillMaxSize()) {
         LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
@@ -276,6 +314,7 @@ fun ChatScreen(
                     },
                     onQuote = { quoteDraft = message },
                     modifier = Modifier.animateItem()
+                    onBurnOpen = { chatViewModel.openBurnMessage(it) },
                 )
             }
 
@@ -290,6 +329,40 @@ fun ChatScreen(
                     ) {
                         Text("开始聊天吧", style = MaterialTheme.typography.bodyLarge,
                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f))
+                    }
+                }
+            }
+        }
+
+            // BUG-05：不在底部时，新消息只用浮标提示（用户自己决定何时跳回去）
+            if (pendingNewMessages > 0) {
+                Surface(
+                    onClick = {
+                        scope.launch {
+                            listState.scrollToItem(messages.size)
+                            pendingNewMessages = 0
+                        }
+                    },
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(end = 16.dp, bottom = 16.dp),
+                    shape = RoundedCornerShape(20.dp),
+                    color = MaterialTheme.colorScheme.primary,
+                    shadowElevation = 4.dp
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Filled.KeyboardArrowDown, "回到最新",
+                            tint = MaterialTheme.colorScheme.onPrimary,
+                            modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            "$pendingNewMessages 条新消息",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onPrimary
+                        )
                     }
                 }
             }
@@ -387,6 +460,39 @@ fun ChatScreen(
         }
     }
 
+    // BUG-09：记录「当前正在看的会话」，避免给正在看的会话再弹通知
+    DisposableEffect(friendUid) {
+        AppForeground.activeChatId = friendUid
+        onDispose {
+            if (AppForeground.activeChatId == friendUid) AppForeground.activeChatId = null
+        }
+    }
+
+    // ALIGN-02：回到前台补一次回执刷新（配合事件驱动，不再 5 秒轮询）
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> chatViewModel.onScreenResumed()
+                // ALIGN-14：后台停掉前台专用的刷新型工作
+                Lifecycle.Event.ON_PAUSE -> chatViewModel.onScreenPaused()
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    // ALIGN-13：向上滚到顶时按需拉取更早一页（进入会话只拉最新页）
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.firstVisibleItemIndex }
+            .distinctUntilChanged()
+            .collect { firstVisible ->
+                // 内部已有 isLoadingMore / historyHasMore 守卫，这里只做触发
+                if (firstVisible <= 2) chatViewModel.loadMoreHistory()
+            }
+    }
+
     DisposableEffect(Unit) {
         onDispose { chatViewModel.destroy() }
     }
@@ -406,6 +512,8 @@ private fun MessageBubble(
     onClaimRedPacket: (String) -> Unit = {},
     onCopy: () -> Unit = {},
     onQuote: () -> Unit = {},
+    // ALIGN-17：阅后即焚「已查看」上报
+    onBurnOpen: (Message) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val bubbleColor = if (isOwn)
@@ -426,6 +534,20 @@ private fun MessageBubble(
 
     // 长按菜单状态
     var menuExpanded by remember { mutableStateOf(false) }
+
+    // BUG-21 / ALIGN-17：阅后即焚。
+    // 原实现只把 burn_after_seconds 解析进模型，UI 完全无视 → 「阅后即焚」形同虚设。
+    // 现在：点击查看一次 → 倒计时 burnAfterSeconds → 到期销毁正文（本地不再展示）。
+    // 注意：服务端销毁回执端点未在官方文档中给出，这里只做本地销毁，不伪造服务端行为。
+    if (message.burnAfterSeconds > 0) {
+        BurnMessageBubble(
+            message = message,
+            isOwn = isOwn,
+            modifier = modifier,
+            onOpen = { onBurnOpen(message) }
+        )
+        return
+    }
 
     Box {
         Row(
@@ -1189,5 +1311,75 @@ private fun formatFileSize(bytes: Long): String {
         bytes < 1024 * 1024 -> "%.1f KB".format(bytes / 1024.0)
         bytes < 1024 * 1024 * 1024 -> "%.1f MB".format(bytes / (1024.0 * 1024))
         else -> "%.1f GB".format(bytes / (1024.0 * 1024 * 1024))
+    }
+}
+
+
+/**
+ * ALIGN-17 / BUG-21：阅后即焚气泡。
+ *
+ * 状态机：locked（未读）→ counting（已展开，倒计时中）→ burned（已销毁）。
+ * 销毁只作用于本地展示与内存列表，不伪装「服务端已删除」——
+ * 官方文档未定义销毁回执端点，客户端不应该假装做过。
+ */
+@Composable
+private fun BurnMessageBubble(
+    message: Message,
+    isOwn: Boolean,
+    modifier: Modifier = Modifier,
+    onOpen: () -> Unit = {}
+) {
+    var revealed by remember(message.id) { mutableStateOf(false) }
+    var remaining by remember(message.id) { mutableStateOf(message.burnAfterSeconds) }
+    var burned by remember(message.id) { mutableStateOf(false) }
+
+    LaunchedEffect(revealed, remaining) {
+        if (!revealed || remaining <= 0) return@LaunchedEffect
+        delay(1000L)
+        remaining -= 1
+        if (remaining <= 0) burned = true
+    }
+
+    val content = MessagePayloadBuilder.extractPreviewText(message.msgType, message.body)
+
+    Row(
+        modifier = modifier.fillMaxWidth().padding(vertical = 2.dp),
+        horizontalArrangement = if (isOwn) Arrangement.End else Arrangement.Start
+    ) {
+        Surface(
+            shape = RoundedCornerShape(16.dp),
+            color = MaterialTheme.colorScheme.surfaceVariant,
+            modifier = Modifier.clickable(enabled = !revealed && !burned) {
+                revealed = true
+                // ALIGN-17：查看即上报（只对对方发来的消息上报，自己发的不需要）
+                if (!isOwn) onOpen()
+            }
+        ) {
+            Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Filled.LocalFireDepartment, null,
+                        modifier = Modifier.size(14.dp),
+                        tint = MaterialTheme.colorScheme.error)
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        when {
+                            burned -> "已焚毁"
+                            revealed -> "阅后即焚 · ${remaining}s"
+                            else -> "阅后即焚消息"
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
+                if (revealed && !burned) {
+                    Spacer(Modifier.height(6.dp))
+                    Text(content.ifBlank { "[非文本消息]" }, style = MaterialTheme.typography.bodyMedium)
+                } else if (!revealed) {
+                    Spacer(Modifier.height(6.dp))
+                    Text("点击查看", style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        }
     }
 }

@@ -28,11 +28,24 @@ class PageCache(context: Context) {
 
     /** 写缓存（同步 apply，内存态立即生效，写盘异步摊还）。 */
     fun write(key: String, json: String) {
-        prefs.edit()
+        val editor = prefs.edit()
             .putString(key, json)
             .putLong("${key}_ts", System.currentTimeMillis())
-            .apply()
+
+        // ALIGN-10：缓存没有任何上限，长期使用后 SharedPreferences 会被页面 JSON 撑大
+        // （每次写盘都是整表序列化）。超过 MAX_KEYS 时按时间戳淘汰最旧的 key。
+        val keys = dataKeys()
+        if (keys.size > MAX_KEYS) {
+            keys.sortedBy { prefs.getLong("${it}_ts", 0L) }
+                .take(keys.size - MAX_KEYS)
+                .forEach { editor.remove(it).remove("${it}_ts") }
+        }
+        editor.apply()
     }
+
+    /** 当前缓存的所有数据 key（排除内部使用的 _ts 键）。 */
+    private fun dataKeys(): List<String> =
+        prefs.all.keys.filter { !it.endsWith("_ts") }
 
     /** 清空单个 key。 */
     fun remove(key: String) {
@@ -42,5 +55,10 @@ class PageCache(context: Context) {
     /** 清空所有页面缓存（账号切换时调用）。 */
     fun clearAll() {
         prefs.edit().clear().apply()
+    }
+
+    companion object {
+        /** ALIGN-10：页面缓存 key 上限 */
+        private const val MAX_KEYS = 40
     }
 }

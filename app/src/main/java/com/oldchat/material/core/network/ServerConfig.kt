@@ -67,6 +67,52 @@ class ServerConfig(context: Context) {
         else "$base/v1/uploads/$path"
     }
 
+    /**
+     * ALIGN-25：注册已迁移到网页端，服务端会在 POST /auth/register 的响应里给出
+     * register_url；本地按同一主机推导，避免硬编码域名。
+     */
+    fun resolveRegisterUrl(): String = "${mediaHostBase()}/register"
+
+    /**
+     * ALIGN-07：§6.1 要求媒体/头像按「候选线路」顺序尝试（文件服务器 → API 主机 → 已知镜像）。
+     * 返回去重后的有序候选列表，调用方逐个回退（加载失败就换下一个）。
+     */
+    fun resolveMediaUrlCandidates(path: String?): List<String> {
+        if (path.isNullOrBlank()) return emptyList()
+        if (path.startsWith("http://") || path.startsWith("https://")) return listOf(path)
+
+        val suffix = if (path.startsWith("/")) path else "/v1/uploads/$path"
+        val bases = buildList {
+            val files = filesBaseUrl.trim().trimEnd('/')
+            if (files.isNotEmpty()) add(files)
+            add(mediaHostBase())
+            addAll(MEDIA_SERVER_CANDIDATES)
+        }
+        return bases.map { it.trimEnd('/') + suffix }.distinct()
+    }
+
+    /**
+     * ALIGN-07：给定一个「已拼好的绝对媒体 URL」，给出同路径的备用线路。
+     * 由 Coil 拦截器在加载失败时按顺序重试，实现 §6.1 的候选线路回退。
+     */
+    fun alternativeOriginsFor(url: String): List<String> {
+        if (!url.startsWith("http")) return listOf(url)
+        return try {
+            val uri = java.net.URI(url)
+            val suffix = (uri.rawPath ?: "") + (uri.rawQuery?.let { "?$it" } ?: "")
+            val bases = buildList {
+                add("${uri.scheme}://${uri.rawAuthority}")
+                val files = filesBaseUrl.trim().trimEnd('/')
+                if (files.isNotEmpty()) add(files)
+                add(mediaHostBase())
+                MEDIA_SERVER_CANDIDATES.forEach { add(it) }
+            }
+            bases.map { it.trimEnd('/') + suffix }.distinct()
+        } catch (_: Exception) {
+            listOf(url)
+        }
+    }
+
     companion object {
         // Default server (from client-guide.md §18: HttpUtil.BASE_URL 默认为 http://60.205.94.101:8080/v1)
         const val DEFAULT_BASE_URL = "http://60.205.94.101:8080/v1"

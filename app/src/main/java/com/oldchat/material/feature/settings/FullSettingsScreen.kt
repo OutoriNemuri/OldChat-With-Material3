@@ -39,6 +39,12 @@ fun FullSettingsScreen(
     val displayScale by dpiManager.displayScale.collectAsState(initial = 1.0f)
     val isDark by preferences.isDarkMode.collectAsState(initial = false)
     val receiveMode by preferences.messageReceiveMode.collectAsState(initial = "ws_priority")
+    // BUG-08：这三个开关原来只写不读（UI 甚至是写死的 checked = true / 空回调）
+    val useDynamicColor by preferences.useDynamicColor.collectAsState(initial = true)
+    val notifEnabled by preferences.notificationsEnabled.collectAsState(initial = true)
+    val notifSound by preferences.notificationSound.collectAsState(initial = true)
+    val notifVibration by preferences.notificationVibration.collectAsState(initial = true)
+    val showNews by preferences.showNewsSection.collectAsState(initial = true)
 
     var showDpiDialog by remember { mutableStateOf(false) }
     var showLogoutDialog by remember { mutableStateOf(false) }
@@ -49,7 +55,10 @@ fun FullSettingsScreen(
     var showReceiveModeDialog by remember { mutableStateOf(false) }
     var showFeedbackDialog by remember { mutableStateOf(false) }
     var showCacheDialog by remember { mutableStateOf(false) }
-    val serverUrl by remember { mutableStateOf(OldChatApplication.instance.serverConfig.baseUrl) }
+    // BUG-03：必须以 ServerConfig 为唯一真相源。原实现是 `val ... by remember { mutableStateOf(...) }`，
+    // 只取一次初值，保存后 state 不更新 → 重开对话框显示旧地址，再点保存就把新地址回滚掉。
+    var serverUrl by remember { mutableStateOf(OldChatApplication.instance.serverConfig.baseUrl) }
+    var filesServerUrl by remember { mutableStateOf(OldChatApplication.instance.serverConfig.filesBaseUrl) }
 
     // 缓存占用状态（后台 IO 计算）
     var cacheGroups by remember { mutableStateOf<List<CacheManager.CacheGroup>>(emptyList()) }
@@ -108,7 +117,7 @@ fun FullSettingsScreen(
                 SettingsRow(
                     Icons.Filled.FolderOpen,
                     "文件服务器",
-                    subtitle = OldChatApplication.instance.serverConfig.filesBaseUrl.ifBlank { "未设置（跟随登录服务器）" },
+                    subtitle = filesServerUrl.ifBlank { "未设置（跟随登录服务器）" },
                     onClick = { showFilesServerDialog = true }
                 )
             }
@@ -127,12 +136,32 @@ fun FullSettingsScreen(
                     }
                 )
             }
+            item(key = "dynamic_color") {
+                SettingsToggleRow(
+                    icon = Icons.Filled.Palette,
+                    title = "动态取色",
+                    checked = useDynamicColor,
+                    onToggle = {
+                        scope.launch { preferences.setDynamicColor(it) }
+                    }
+                )
+            }
             item(key = "dpi_scale") {
                 SettingsRow(
                     Icons.Filled.Language,
                     "DPI 缩放",
                     subtitle = "字体 ${(fontScale * 100).toInt()}% · 界面 ${(displayScale * 100).toInt()}%",
                     onClick = { showDpiDialog = true }
+                )
+            }
+
+            // BUG-08：首页新闻区开关（原来只在 DataStore 里写，UI 无处可点）
+            item(key = "show_news") {
+                SettingsToggleRow(
+                    icon = Icons.Filled.Article,
+                    title = "首页显示新闻区",
+                    checked = showNews,
+                    onToggle = { scope.launch { preferences.setShowNews(it) } }
                 )
             }
 
@@ -144,8 +173,28 @@ fun FullSettingsScreen(
                 SettingsToggleRow(
                     icon = Icons.Filled.Notifications,
                     title = "消息通知",
-                    checked = true,
-                    onToggle = { /* notification toggle stored in settings; kept default on */ }
+                    checked = notifEnabled,
+                    onToggle = {
+                        scope.launch { preferences.setNotificationsEnabled(it) }
+                    }
+                )
+            }
+            item(key = "notif_sound") {
+                SettingsToggleRow(
+                    icon = Icons.Filled.Notifications,
+                    title = "通知声音",
+                    checked = notifSound,
+                    enabled = notifEnabled,
+                    onToggle = { scope.launch { preferences.setNotificationSound(it) } }
+                )
+            }
+            item(key = "notif_vibration") {
+                SettingsToggleRow(
+                    icon = Icons.Filled.Notifications,
+                    title = "通知震动",
+                    checked = notifVibration,
+                    enabled = notifEnabled,
+                    onToggle = { scope.launch { preferences.setNotificationVibration(it) } }
                 )
             }
             item(key = "receive_mode") {
@@ -271,7 +320,9 @@ fun FullSettingsScreen(
             },
             confirmButton = {
                 TextButton(onClick = {
-                    OldChatApplication.instance.serverConfig.baseUrl = url.trim()
+                    val normalized = url.trim()
+                    OldChatApplication.instance.serverConfig.baseUrl = normalized
+                    serverUrl = normalized   // BUG-03：同步刷新 UI 状态，避免下次打开显示旧值
                     showServerDialog = false
                 }) { Text("保存") }
             },
@@ -302,7 +353,9 @@ fun FullSettingsScreen(
             },
             confirmButton = {
                 TextButton(onClick = {
-                    OldChatApplication.instance.serverConfig.filesBaseUrl = url.trim()
+                    val normalized = url.trim()
+                    OldChatApplication.instance.serverConfig.filesBaseUrl = normalized
+                    filesServerUrl = normalized   // BUG-03：同上，保持副标题与配置一致
                     showFilesServerDialog = false
                 }) { Text("保存") }
             },
@@ -320,7 +373,8 @@ fun FullSettingsScreen(
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("OldChat Material", style = MaterialTheme.typography.titleMedium)
-                    Text("版本 2.3.4 (build 1)", style = MaterialTheme.typography.bodyMedium)
+                    Text("版本 ${com.oldchat.material.BuildConfig.VERSION_NAME}",
+                        style = MaterialTheme.typography.bodyMedium)
                     Spacer(Modifier.height(4.dp))
                     Text("Material You 设计的第三方 OldChat Material 客户端。",
                         style = MaterialTheme.typography.bodySmall,
@@ -659,6 +713,7 @@ private fun SettingsToggleRow(
     icon: ImageVector,
     title: String,
     checked: Boolean,
+    enabled: Boolean = true,
     onToggle: (Boolean) -> Unit
 ) {
     Surface(
@@ -682,9 +737,18 @@ private fun SettingsToggleRow(
                 }
             }
             Spacer(Modifier.width(14.dp))
-            Text(title, style = MaterialTheme.typography.titleMedium,
-                modifier = Modifier.weight(1f))
-            Switch(checked = checked, onCheckedChange = onToggle)
+            Text(
+                title,
+                style = MaterialTheme.typography.titleMedium,
+                color = if (enabled) MaterialTheme.colorScheme.onSurface
+                        else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f),
+                modifier = Modifier.weight(1f)
+            )
+            Switch(
+                checked = checked,
+                enabled = enabled,
+                onCheckedChange = onToggle
+            )
         }
     }
 }

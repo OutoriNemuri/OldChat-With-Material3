@@ -97,6 +97,18 @@ class CacheManager(context: Context) {
     /**
      * Clear all caches. Called on account UID change.
      */
+    /**
+     * ALIGN-18：切换账号时清理「与账号强相关」的本地数据。
+     * 注意：不清服务器地址等设备级配置。
+     */
+    fun clearAccountScoped() {
+        messageHistory.clearAll()
+        recentChats.clearAll()
+        friends.clearAll()
+        groups.clearAll()
+        pageCache.clearAll()
+    }
+
     fun clearAll() {
         messageHistory.clearAll()
         recentChats.clearAll()

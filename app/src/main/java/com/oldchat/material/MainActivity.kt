@@ -1,10 +1,17 @@
 package com.oldchat.material
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
+import com.oldchat.material.core.notify.AppForeground
+import com.oldchat.material.core.notify.NotificationHelper
 import androidx.compose.runtime.*
 import com.oldchat.material.feature.auth.LoginScreen
 import com.oldchat.material.service.MusicPlaybackService
@@ -30,11 +37,20 @@ class MainActivity : ComponentActivity() {
             private set
     }
 
+    /** BUG-09：通知权限（API 33+）与录音权限（语音消息）的运行时申请入口。 */
+    private val permissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { /* 结果无需回调处理：用户拒绝时通知/录音静默不可用即可 */ }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
         val authManager = (application as OldChatApplication).authManager
+
+        // BUG-09：通知通道 + 各通知偏好（开关/声音/震动）订阅只做一次
+        NotificationHelper.init(this)
+        requestRuntimePermissions()
 
         setContent {
             OldChatMaterialTheme {
@@ -75,6 +91,39 @@ class MainActivity : ComponentActivity() {
         if (!open) return null
         val title = intent.getStringExtra(MusicPlaybackService.EXTRA_MUSIC_TITLE)
         return title?.takeIf { it.isNotEmpty() }
+    }
+
+    /**
+     * BUG-09：原来工程里没有任何运行时权限申请 —— 通知（API 33+）与录音（语音消息）
+     * 都会静默失效。这里在进入主界面时申请一次。
+     */
+    private fun requestRuntimePermissions() {
+        val wanted = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            wanted += Manifest.permission.POST_NOTIFICATIONS
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            wanted += Manifest.permission.RECORD_AUDIO
+        }
+        if (wanted.isNotEmpty()) {
+            permissionLauncher.launch(wanted.toTypedArray())
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        // BUG-09 / ALIGN-06：前台标记，避免给「正在看的会话」重复弹通知
+        AppForeground.isForeground = true
+    }
+
+    override fun onStop() {
+        super.onStop()
+        AppForeground.isForeground = false
     }
 
     override fun onResume() {

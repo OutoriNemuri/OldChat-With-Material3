@@ -40,11 +40,20 @@ class MessageHistoryCache(
     // Pause state: during scroll, pause saves; resume after scroll stops
     @Volatile
     private var savePaused = false
-    private var pendingSnapshot: List<Message>? = null
-    private var pendingGroupSnapshot: List<GroupMessage>? = null
+
+    // BUG-17：暂停期间按「key」暂存最新快照。原实现只留一个 pendingSnapshot 且
+    // resumeSave() 是个空壳（既不写盘也不清状态）——暂停期间的消息更新会被直接丢掉。
+    private val pendingSaves = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    // BUG-17：写盘合并。注释写着 coalesced，原实现却是每次调用都排队写一次
+    // （消息密集时 SharedPreferences 序列化整表 N 次/秒）。这里按 key 去抖。
+    private val flushJobs = java.util.concurrent.ConcurrentHashMap<String, Job>()
 
     companion object {
         const val MAX_MESSAGES = 200
+
+        /** 写盘去抖窗口（毫秒） */
+        private const val SAVE_DEBOUNCE_MS = 500L
     }
 
     // ---- Direct Messages ----
@@ -54,25 +63,28 @@ class MessageHistoryCache(
      * Filters out pending messages. Keeps last 200.
      */
     fun saveDirectMessages(uid: String, messages: List<Message>) {
-        // Filter out pending messages
         val snapshot = messages
             .filter { !it.isLocalPending }
             .takeLast(MAX_MESSAGES)
+        if (snapshot.isEmpty()) return
+        scheduleWrite("direct_$uid", gson.toJson(snapshot))
+    }
 
+    /** BUG-17：统一的去抖写盘（暂停时只暂存，恢复时一次性落盘）。 */
+    private fun scheduleWrite(key: String, json: String) {
         if (savePaused) {
-            pendingSnapshot = snapshot
+            pendingSaves[key] = json
             return
         }
-
+        flushJobs.remove(key)?.cancel()
         val gen = generation.get()
-        saveScope.launch {
+        flushJobs[key] = saveScope.launch {
+            delay(SAVE_DEBOUNCE_MS)
             saveMutex.withLock {
-                // Check generation to prevent stale saves after clearAll
                 if (generation.get() != gen) return@withLock
-
-                val json = gson.toJson(snapshot)
-                prefs.edit().putString("direct_$uid", json).apply()
+                prefs.edit().putString(key, json).apply()
             }
+            flushJobs.remove(key)
         }
     }
 
@@ -108,21 +120,8 @@ class MessageHistoryCache(
         val snapshot = messages
             .filter { !it.isLocalPending }
             .takeLast(MAX_MESSAGES)
-
-        if (savePaused) {
-            pendingGroupSnapshot = snapshot
-            return
-        }
-
-        val gen = generation.get()
-        saveScope.launch {
-            saveMutex.withLock {
-                if (generation.get() != gen) return@withLock
-
-                val json = gson.toJson(snapshot)
-                prefs.edit().putString("group_$groupId", json).apply()
-            }
-        }
+        if (snapshot.isEmpty()) return
+        scheduleWrite("group_$groupId", gson.toJson(snapshot))
     }
 
     /**
@@ -154,8 +153,7 @@ class MessageHistoryCache(
      */
     fun pauseSave() {
         savePaused = true
-        pendingSnapshot = null
-        pendingGroupSnapshot = null
+        pendingSaves.clear()
     }
 
     /**
@@ -164,15 +162,17 @@ class MessageHistoryCache(
      */
     fun resumeSave() {
         savePaused = false
-        pendingSnapshot?.let { snapshot ->
-            pendingSnapshot = null
-            val gen = generation.get()
-            saveScope.launch {
-                saveMutex.withLock {
-                    if (generation.get() != gen) return@withLock
-                    // Snapshot needs uid context; pending snapshot stores message list
-                    // The UID is implied from the last save call context; for now flush generically
-                }
+        // BUG-17：把暂停期间攒下的最新快照真正落盘（原实现是空函数体，数据直接丢）
+        if (pendingSaves.isEmpty()) return
+        val snapshot = HashMap(pendingSaves)
+        pendingSaves.clear()
+        val gen = generation.get()
+        saveScope.launch {
+            saveMutex.withLock {
+                if (generation.get() != gen) return@withLock
+                val editor = prefs.edit()
+                snapshot.forEach { (key, json) -> editor.putString(key, json) }
+                editor.apply()
             }
         }
     }
@@ -183,8 +183,9 @@ class MessageHistoryCache(
      */
     fun clearAll() {
         generation.incrementAndGet()
-        pendingSnapshot = null
-        pendingGroupSnapshot = null
+        pendingSaves.clear()
+        flushJobs.values.forEach { it.cancel() }
+        flushJobs.clear()
         prefs.edit().clear().apply()
     }
 

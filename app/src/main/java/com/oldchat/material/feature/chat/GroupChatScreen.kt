@@ -375,6 +375,14 @@ fun GroupChatScreen(
         )
     }
 
+    // BUG-09：标记当前正在查看的群会话，避免给自己正在看的会话弹通知
+    DisposableEffect(groupId) {
+        AppForeground.activeChatId = groupId
+        onDispose {
+            if (AppForeground.activeChatId == groupId) AppForeground.activeChatId = null
+        }
+    }
+
     DisposableEffect(Unit) {
         onDispose { groupViewModel.destroy() }
     }

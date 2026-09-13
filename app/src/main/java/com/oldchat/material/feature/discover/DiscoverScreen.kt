@@ -14,6 +14,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.oldchat.material.OldChatApplication
 
 /**
  * Discover tab — entry points for Moments, Emoji Plaza, Music, News, etc.
@@ -26,18 +28,34 @@ fun DiscoverScreen(
     modifier: Modifier = Modifier,
     onNavigate: (String) -> Unit = {}
 ) {
-    val entries = discoverEntries.map { entry ->
-        entry.copy(
-            onClick = { onNavigate(entry.route) }
-        )
-    }
+    // BUG-08：这几个开关原来写了 DataStore 却没人读 → 关掉后入口照样在。
+    // 现在真正按偏好过滤发现页入口（可关的项仍然保留「发现设置」入口本身）。
+    val preferences = OldChatApplication.instance.cacheManager.preferences
+    val showNews by preferences.showNewsSection.collectAsStateWithLifecycle(initialValue = true)
+    val showOldView by preferences.showOldViewEntry.collectAsStateWithLifecycle(initialValue = true)
+    val showPublicCourt by preferences.showPublicCourtEntry.collectAsStateWithLifecycle(initialValue = true)
+
+    val entries = discoverEntries
+        .filter { entry ->
+            when (entry.route) {
+                "news" -> showNews
+                "oldview" -> showOldView
+                "public_court" -> showPublicCourt
+                else -> true
+            }
+        }
+        .map { entry ->
+            entry.copy(
+                onClick = { onNavigate(entry.route) }
+            )
+        }
 
     LazyColumn(
         modifier = modifier.fillMaxSize(),
         contentPadding = PaddingValues(vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(4.dp)
     ) {
-        items(entries) { entry ->
+        items(entries, key = { it.route }) { entry ->
             DiscoverEntry(
                 icon = entry.icon,
                 title = entry.title,

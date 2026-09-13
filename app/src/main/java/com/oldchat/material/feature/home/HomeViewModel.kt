@@ -1,3 +1,4 @@
+@file:OptIn(kotlinx.coroutines.FlowPreview::class)
 package com.oldchat.material.feature.home
 
 import androidx.lifecycle.ViewModel
@@ -55,6 +56,12 @@ class HomeViewModel : ViewModel() {
     private fun loadCache() {
         // Load recent chats
         cacheManager.recentChats.loadFromDisk()
+        viewModelScope.launch {
+            recentChatsRefresh
+                .debounce(RECENT_CHATS_MERGE_MS)
+                .collect { _recentChats.value = cacheManager.recentChats.getAll() }
+        }
+
         _recentChats.value = cacheManager.recentChats.getAll()
 
         // Load friends
@@ -87,7 +94,7 @@ class HomeViewModel : ViewModel() {
                         unreadCount = if (isOwn) existing.unreadCount else existing.unreadCount + 1
                     )
                     cacheManager.recentChats.upsert(updated)
-                    _recentChats.value = cacheManager.recentChats.getAll()
+                    requestRecentChatsRefresh()   // ALIGN-12：合并刷新
                 } else {
                     val newItem = RecentChatItem(
                         type = "direct",
@@ -101,7 +108,7 @@ class HomeViewModel : ViewModel() {
                         unreadCount = if (isOwn) 0 else 1
                     )
                     cacheManager.recentChats.upsert(newItem)
-                    _recentChats.value = cacheManager.recentChats.getAll()
+                    requestRecentChatsRefresh()   // ALIGN-12：合并刷新
                 }
             }
         }
@@ -123,7 +130,7 @@ class HomeViewModel : ViewModel() {
                         unreadCount = if (isOwn) existing.unreadCount else existing.unreadCount + 1
                     )
                     cacheManager.recentChats.upsert(updated)
-                    _recentChats.value = cacheManager.recentChats.getAll()
+                    requestRecentChatsRefresh()   // ALIGN-12：合并刷新
                 } else {
                     // 新群会话也新建/更新条目，避免预览不刷新
                     val newItem = RecentChatItem(
@@ -138,7 +145,7 @@ class HomeViewModel : ViewModel() {
                         unreadCount = if (isOwn) 0 else 1
                     )
                     cacheManager.recentChats.upsert(newItem)
-                    _recentChats.value = cacheManager.recentChats.getAll()
+                    requestRecentChatsRefresh()   // ALIGN-12：合并刷新
                 }
             }
         }
@@ -156,6 +163,51 @@ class HomeViewModel : ViewModel() {
         }
     }
 
+    // ---- ALIGN-01：会话列表预览的「反滥用」闸门 ----
+    // 规范 §0：不允许朴素全量刷新（每个会话都回源一次历史）——会被监测/限流/封禁。
+    // §7.1：lastMessage 优先用服务端随列表下发的字段与本地缓存，只有确实没有预览时
+    // 才回源，且并发受限、每个会话最多补一次。
+    private val previewFetched: MutableSet<String> =
+        java.util.Collections.synchronizedSet(mutableSetOf<String>())
+    private val previewGate = kotlinx.coroutines.sync.Semaphore(4)
+
+    // ALIGN-12：会话列表刷新的 220ms 合并窗口。
+    // 原实现每收到一条 WS 消息就重排/重发一次列表状态 —— 消息成串到达时
+    // Compose 会连续重组 N 次。这里统一走这个触发器，合并成一次。
+    private val recentChatsRefresh = MutableSharedFlow<Unit>(
+        extraBufferCapacity = 32,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+
+    private fun requestRecentChatsRefresh() {
+        recentChatsRefresh.tryEmit(Unit)
+    }
+
+    /**
+     * 服务端随 /friends、/groups 下发的 last_message 解析结果：
+     * uid/gid -> Triple(body, msgType, createdAt)
+     */
+    private fun parseServerLastMessages(json: String, key: String = "last_message"):
+        Map<String, Triple<String, String, Long>> {
+        val out = mutableMapOf<String, Triple<String, String, Long>>()
+        return try {
+            val root = app.gson.fromJson(json, Map::class.java) as? Map<*, *> ?: return out
+            val list = (root["friends"] ?: root["groups"] ?: root["items"] ?: root["list"]) as? List<*>
+                ?: return out
+            list.filterIsInstance<Map<*, *>>().forEach { item ->
+                val id = (item["uid"] ?: item["id"] ?: item["group_id"])?.toString()
+                val last = item[key] as? Map<*, *> ?: return@forEach
+                if (id.isNullOrEmpty()) return@forEach
+                out[id] = Triple(
+                    last["body"]?.toString() ?: "",
+                    last["msg_type"]?.toString() ?: "text",
+                    (last["created_at"] as? Number)?.toLong() ?: 0L
+                )
+            }
+            out
+        } catch (_: Exception) { out }
+    }
+
     // ---- Actions ----
 
     // NOTE: The server has no /me/recents HTTP endpoint (verified via live API).
@@ -163,7 +215,7 @@ class HomeViewModel : ViewModel() {
     // WebSocket messages. So we just re-read the cache here.
     fun refreshChats() {
         cacheManager.recentChats.loadFromDisk()
-        _recentChats.value = cacheManager.recentChats.getAll()
+        requestRecentChatsRefresh()   // ALIGN-12：合并刷新
     }
 
     fun refreshFriends() {
@@ -176,7 +228,7 @@ class HomeViewModel : ViewModel() {
                         _friends.value = list
                         cacheManager.friends.replaceAll(list)
                         // 用好友列表初始化聊天列表（服务端无独立会话列表端点）
-                        syncChatListFromFriends(list)
+                        syncChatListFromFriends(list, parseServerLastMessages(json))
                     }
                 }
             } catch (_: Exception) { /* offline */ }
@@ -188,7 +240,10 @@ class HomeViewModel : ViewModel() {
      * 为每个好友 upsert 一个 direct 会话条目（仅当尚不存在时），
      * 这样即使从未收到过该好友的 WS 消息，列表也能显示出来。
      */
-    private fun syncChatListFromFriends(friends: List<User>) {
+    private fun syncChatListFromFriends(
+        friends: List<User>,
+        serverLastMessages: Map<String, Triple<String, String, Long>> = emptyMap()
+    ) {
         val existing = cacheManager.recentChats.getAll().associateBy { it.chatId }
         val existingIds = existing.keys
         var changed = false
@@ -220,11 +275,35 @@ class HomeViewModel : ViewModel() {
                 )
                 changed = true
             }
-            // 所有会话都刷新最新预览（不限于新会话），修复"会话列表最新一条不新"
-            fillDirectPreview(friend.uid)
+            // ALIGN-01 修正：原来对「所有」好友都回源一次 /direct/messages/v2。
+            // 现在优先用服务端 last_message，其次用本地已有预览；
+            // 只有两者都没有（真正没预览的新会话）才回源一次。
+            val serverMsg = serverLastMessages[friend.uid]
+            when {
+                serverMsg != null -> {
+                    val (body, msgType, createdAt) = serverMsg
+                    val localTime = current?.lastTime ?: 0L
+                    if (body.isNotEmpty() && createdAt >= localTime) {
+                        cacheManager.recentChats.upsert(
+                            (current ?: RecentChatItem(
+                                type = "direct",
+                                chatId = friend.uid,
+                                name = friend.nickname,
+                                avatarUrl = resolvedAvatar
+                            )).copy(
+                                lastMessage = extractPreview(msgType, body),
+                                lastMessageType = msgType,
+                                lastTime = createdAt
+                            )
+                        )
+                        changed = true
+                    }
+                }
+                current?.lastMessage.isNullOrEmpty() -> fillDirectPreview(friend.uid)
+            }
         }
         if (changed) {
-            _recentChats.value = cacheManager.recentChats.getAll()
+            requestRecentChatsRefresh()   // ALIGN-12：合并刷新
         }
     }
 
@@ -233,8 +312,12 @@ class HomeViewModel : ViewModel() {
      * 为每个会话异步拉取最新一条消息填充预览。
      */
     private fun fillDirectPreview(uid: String) {
+        if (uid.isEmpty()) return
+        // 每个会话最多补一次，避免每次刷新都重复回源
+        if (!previewFetched.add("d:$uid")) return
         viewModelScope.launch {
             try {
+                previewGate.withPermit {
                 val result = app.apiClient.get("/direct/messages/v2", mapOf("with_uid" to uid, "limit" to "1"))
                 result.onSuccess { body ->
                     val msg = parseLatestMessage(body)
@@ -251,8 +334,9 @@ class HomeViewModel : ViewModel() {
                                 lastTime = msg.createdAt
                             )
                         )
-                        _recentChats.value = cacheManager.recentChats.getAll()
+                        requestRecentChatsRefresh()   // ALIGN-12：合并刷新
                     }
+                }
                 }
             } catch (_: Exception) {}
         }
@@ -281,7 +365,10 @@ class HomeViewModel : ViewModel() {
     /**
      * 用群列表初始化聊天列表（显示群会话）。
      */
-    private fun syncChatListFromGroups(groups: List<Group>) {
+    private fun syncChatListFromGroups(
+        groups: List<Group>,
+        serverLastMessages: Map<String, Triple<String, String, Long>> = emptyMap()
+    ) {
         val existing = cacheManager.recentChats.getAll().associateBy { it.chatId }
         val existingIds = existing.keys
         var changed = false
@@ -311,11 +398,34 @@ class HomeViewModel : ViewModel() {
                 )
                 changed = true
             }
-            // 所有群会话都刷新最新预览（不限于新会话），修复"会话列表最新一条不新"
-            fillGroupPreview(group.id, group.name)
+            // ALIGN-01 修正：同私聊——优先服务端 last_message / 本地预览，
+            // 只有确实没有预览的新群会话才回源一次。
+            val serverMsg = serverLastMessages[group.id]
+            when {
+                serverMsg != null -> {
+                    val (body, msgType, createdAt) = serverMsg
+                    val localTime = current?.lastTime ?: 0L
+                    if (body.isNotEmpty() && createdAt >= localTime) {
+                        cacheManager.recentChats.upsert(
+                            (current ?: RecentChatItem(
+                                type = "group",
+                                chatId = group.id,
+                                name = group.name,
+                                avatarUrl = resolvedAvatar
+                            )).copy(
+                                lastMessage = extractPreview(msgType, body),
+                                lastMessageType = msgType,
+                                lastTime = createdAt
+                            )
+                        )
+                        changed = true
+                    }
+                }
+                current?.lastMessage.isNullOrEmpty() -> fillGroupPreview(group.id, group.name)
+            }
         }
         if (changed) {
-            _recentChats.value = cacheManager.recentChats.getAll()
+            requestRecentChatsRefresh()   // ALIGN-12：合并刷新
         }
     }
 
@@ -323,8 +433,11 @@ class HomeViewModel : ViewModel() {
      * 异步拉取群会话最新一条消息作为预览。
      */
     private fun fillGroupPreview(gid: String, name: String) {
+        if (gid.isEmpty()) return
+        if (!previewFetched.add("g:$gid")) return
         viewModelScope.launch {
             try {
+                previewGate.withPermit {
                 val result = app.apiClient.get("/groups/messages/v2", mapOf("group_id" to gid, "limit" to "1"))
                 result.onSuccess { body ->
                     val (msgBody, msgType, createdAt) = parseLatestGroupMessage(body)
@@ -341,8 +454,9 @@ class HomeViewModel : ViewModel() {
                                 lastTime = createdAt
                             )
                         )
-                        _recentChats.value = cacheManager.recentChats.getAll()
+                        requestRecentChatsRefresh()   // ALIGN-12：合并刷新
                     }
+                }
                 }
             } catch (_: Exception) {}
         }
@@ -396,7 +510,7 @@ class HomeViewModel : ViewModel() {
                         _groups.value = list
                         cacheManager.groups.replaceAll(list)
                         // 用群列表初始化聊天列表（显示群会话）
-                        syncChatListFromGroups(list)
+                        syncChatListFromGroups(list, parseServerLastMessages(json))
                     }
                 }
             } catch (_: Exception) { /* offline */ }
@@ -499,7 +613,7 @@ class HomeViewModel : ViewModel() {
 
     fun clearUnread(chatId: String) {
         cacheManager.recentChats.clearUnread(chatId)
-        _recentChats.value = cacheManager.recentChats.getAll()
+        requestRecentChatsRefresh()   // ALIGN-12：合并刷新
     }
 
     /**
@@ -532,5 +646,10 @@ class HomeViewModel : ViewModel() {
                 }
             }
         }
+    }
+
+    companion object {
+        /** ALIGN-12：会话列表刷新合并窗口（毫秒）。消息成串到达时合并成一次重组。 */
+        private const val RECENT_CHATS_MERGE_MS = 220L
     }
 }

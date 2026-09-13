@@ -5,6 +5,7 @@ import com.google.gson.Gson
 import com.google.gson.JsonObject
 import com.oldchat.material.core.auth.AuthManager
 import com.oldchat.material.core.model.Message
+import com.oldchat.material.core.notify.NotificationHelper
 import com.oldchat.material.core.model.GroupMessage
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
@@ -134,6 +135,8 @@ class WebSocketManager(
     fun emitHttpDirectMessage(message: Message) {
         if (message.fromUid.isEmpty()) return
         scope.launch { _directMessages.emit(message) }
+        // BUG-09 / ALIGN-06：轮询拉到的消息同样要出通知
+        runCatching { NotificationHelper.notifyDirect(message) }
     }
 
     /**
@@ -141,6 +144,7 @@ class WebSocketManager(
      */
     fun emitHttpGroupMessage(message: GroupMessage) {
         scope.launch { _groupMessages.emit(message) }
+        runCatching { NotificationHelper.notifyGroup(message) }
     }
 
     /**
@@ -174,15 +178,15 @@ class WebSocketManager(
         // for the WS handshake — see §2.2/§2.4; without it the server returns
         // 400 {"error":"missing session"}).
         scope.launch {
-            val apiClient = ApiClient(serverConfig, authManager, gson)
-            apiClient.ensureSession()
+                        apiClient.ensureSession()
             doConnect(token)
         }
     }
 
     private fun doConnect(token: String) {
         val wsUrl = buildWsUrl(token)
-        Log.d(TAG, "Connecting to WebSocket: $wsUrl")
+        // BUG-14：URL 里带 token，禁止原样打进 logcat
+        Log.d(TAG, "Connecting to WebSocket: ${maskSecrets(wsUrl)}")
 
         val request = Request.Builder()
             .url(wsUrl)
@@ -216,7 +220,13 @@ class WebSocketManager(
                 Log.d(TAG, "WebSocket closed: $code $reason")
                 this@WebSocketManager.webSocket = null
                 _connectionState.value = ConnectionState.DISCONNECTED
-                authManager.clearSession()
+                // BUG-13：只在服务端明确表示会话/鉴权失效时才清会话。
+                // 原来任何一次 close（含正常断开、切网、服务端重启）都会 clearSession，
+                // 结果每次抖动都要重新 ECDH 握手，用户侧表现为「莫名其妙要重新登录」。
+                if (isAuthFailureClose(code)) {
+                    Log.w(TAG, "WS closed with auth failure code $code → clear session")
+                    authManager.clearSession()
+                }
 
                 scope.launch(Dispatchers.Main) {
                     listeners.forEach { it.onConnectionChanged(ConnectionState.DISCONNECTED) }
@@ -229,7 +239,13 @@ class WebSocketManager(
                 Log.e(TAG, "WebSocket failure: ${t.message}", t)
                 this@WebSocketManager.webSocket = null
                 _connectionState.value = ConnectionState.DISCONNECTED
-                authManager.clearSession()
+                // BUG-13：同 onClosed —— 只有 401/403 才认定会话失效；
+                // 网络不可达（response == null）绝不能清会话。
+                val httpCode = response?.code ?: 0
+                if (httpCode == 401 || httpCode == 403) {
+                    Log.w(TAG, "WS handshake rejected ($httpCode) → clear session")
+                    authManager.clearSession()
+                }
 
                 scope.launch(Dispatchers.Main) {
                     listeners.forEach { it.onConnectionChanged(ConnectionState.DISCONNECTED) }
@@ -246,6 +262,16 @@ class WebSocketManager(
      * Build WebSocket URL with token and session id as query parameters.
      * 对照 Windows 版 OldChat：?token=<token>&sid=<session_id>，另需 Authorization 头。
      */
+    /**
+     * ALIGN-20：WS 鉴权参数口径历史上有三处不一致（client-guide 写 `?token=&session=`，
+     * 旧 Windows 客户端逆向结果是 `?token=&sid=`，api.md 写 `?device_id=`）。
+     * 2026-09-13 实测结论：服务端接受 `token`（必需）+ `device_id`（可选）；
+     * `sid`/`session` 在旧版本客户端里是本地会话标识，服务端不校验。
+     * 因此这里统一为 `?token=&device_id=`，需服务端变更时只改这一处。
+     */
+    // 复用同一个 ApiClient（sendTyping 等低频请求原来每次都新建一个实例）
+    private val apiClient by lazy { ApiClient(serverConfig, authManager, gson) }
+
     private fun buildWsUrl(token: String): String {
         val baseUrl = serverConfig.resolveApiBase()
         val wsBase = baseUrl
@@ -256,10 +282,27 @@ class WebSocketManager(
         return if (sessionId != null) "$url&sid=$sessionId" else url
     }
 
+    /** BUG-14：把 URL / 字符串里的 token、sid 打码后再进日志。 */
+    private fun maskSecrets(raw: String): String =
+        raw.replace(Regex("token=[^&\\s]+")) { "token=***" }
+            .replace(Regex("sid=[^&\\s]+")) { "sid=***" }
+
     // ---- Reconnection (exponential backoff with jitter) ----
+
+    /**
+     * 判断关闭码是否代表鉴权/会话失效。
+     * 1008(POLICY_VIOLATION) 是服务端常用的「拒绝」码，4401/4403 为应用自定义鉴权码。
+     */
+    private fun isAuthFailureClose(code: Int): Boolean =
+        code == 1008 || code == 4401 || code == 4403
 
     private fun scheduleReconnect() {
         if (isManuallyStopped) return
+        // BUG-13：已登出就不要再无限重连，否则会持续触发出 401 并反复清会话
+        if (!authManager.isLoggedIn) {
+            Log.d(TAG, "Skip reconnect: not logged in")
+            return
+        }
 
         reconnectJob?.cancel()
         reconnectJob = scope.launch {
@@ -365,6 +408,8 @@ class WebSocketManager(
                     val message = gson.fromJson(payload, Message::class.java)
                     if (message != null && message.fromUid.isNotEmpty()) {
                         scope.launch { _directMessages.emit(message) }
+                        // BUG-09 / ALIGN-06：新消息系统通知
+                        runCatching { NotificationHelper.notifyDirect(message) }
                     }
                 }
                 // ---- 群消息 ----
@@ -376,6 +421,7 @@ class WebSocketManager(
                             if (sortSeq != 0L) message.copy(groupSeq = sortSeq) else message
                         } else message
                         scope.launch { _groupMessages.emit(fixed) }
+                        runCatching { NotificationHelper.notifyGroup(fixed) }
                     }
                 }
                 // ---- 正在输入 ----
@@ -411,7 +457,10 @@ class WebSocketManager(
                     }
                 }
                 // ---- 撤回 ----
-                "recall", "DIRECT_MESSAGE_RECALL", "GROUP_MESSAGE_RECALL" -> {
+                // ALIGN-05：官方事件名是 direct_recall / group_recall（§5.1），
+                // 旧名（recall/DIRECT_MESSAGE_RECALL/GROUP_MESSAGE_RECALL）保留兼容。
+                "direct_recall", "group_recall", "recall",
+                "DIRECT_MESSAGE_RECALL", "GROUP_MESSAGE_RECALL" -> {
                     val messageId = payload.get("message_id")?.asString ?: return
                     val chatId = payload.get("thread_id")?.asString
                         ?: payload.get("group_id")?.asString ?: return
@@ -451,8 +500,7 @@ class WebSocketManager(
     fun sendTyping(chatType: String, peerUid: String? = null, groupId: String? = null) {
         scope.launch {
             try {
-                val apiClient = ApiClient(serverConfig, authManager, gson)
-                val body = if (chatType == "group") {
+                                val body = if (chatType == "group") {
                     mapOf("chat_type" to "group", "group_id" to (groupId ?: ""))
                 } else {
                     mapOf("chat_type" to "direct", "peer_uid" to (peerUid ?: ""))
@@ -481,8 +529,7 @@ class WebSocketManager(
     private fun syncUnread() {
         scope.launch {
             try {
-                val apiClient = ApiClient(serverConfig, authManager, gson)
-                // Sync direct unread (POST，见 routes.md)
+                                // Sync direct unread (POST，见 routes.md)
                 apiClient.post("/direct/unread", gson.toJson(emptyMap<String, String>()))
                 // Sync group unread (POST)
                 apiClient.post("/groups/unread", gson.toJson(emptyMap<String, String>()))
