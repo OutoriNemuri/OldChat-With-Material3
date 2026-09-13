@@ -141,7 +141,7 @@ class MessageReceiver(
     }
 
     private fun pollInterval(): Long =
-        if (wsManager.connectionState.value == ConnectionState.CONNECTED) {
+        if (wsManager.connectionState.value == WebSocketManager.ConnectionState.CONNECTED) {
             POLL_INTERVAL_WS_UP_MS
         } else {
             POLL_INTERVAL_WS_DOWN_MS

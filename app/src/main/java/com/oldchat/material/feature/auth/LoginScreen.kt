@@ -12,6 +12,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.*
+import com.oldchat.material.OldChatApplication
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -120,6 +121,10 @@ private fun LoginCard(
     uiState: AuthUiState,
     onOpenRegister: () -> Unit = {}
 ) {
+    // ALIGN-09：隐私协议弹窗状态与跳转用 context（本 composable 内需要）
+    var showPolicyDialog by remember { mutableStateOf(false) }
+    val context = androidx.compose.ui.platform.LocalContext.current
+
     Card(
         modifier = Modifier
             .fillMaxWidth()

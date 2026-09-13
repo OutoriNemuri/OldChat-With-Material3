@@ -104,8 +104,8 @@ class CacheManager(context: Context) {
     fun clearAccountScoped() {
         messageHistory.clearAll()
         recentChats.clearAll()
-        friends.clearAll()
-        groups.clearAll()
+        friends.clear()
+        groups.clear()
         pageCache.clearAll()
     }
 

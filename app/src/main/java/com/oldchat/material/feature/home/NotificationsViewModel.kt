@@ -85,11 +85,10 @@ class NotificationsViewModel : ViewModel() {
         // 按时间倒序（最新在前）
         _notifications.value = items.sortedByDescending { it.createdAt }
 
-        // ALIGN-16：红点 = 存在比「上次已读」更新的通知
+        // ALIGN-16：红点 = 存在比「上次已读时间」更新的通知
+        // （偏好项 lastReadNotificationId 的实际类型是 Long 时间戳，不是通知 id）
         viewModelScope.launch {
-            val lastReadId = app.cacheManager.preferences.lastReadNotificationId.first()
-            val lastReadAt = _notifications.value
-                .firstOrNull { it.id == lastReadId }?.createdAt ?: 0L
+            val lastReadAt = app.cacheManager.preferences.lastReadNotificationId.first()
             _hasUnread.value = _notifications.value.any { it.createdAt > lastReadAt }
             resolveImportantNotice()
         }
@@ -109,7 +108,7 @@ class NotificationsViewModel : ViewModel() {
     fun markAllRead() {
         val newest = _notifications.value.firstOrNull() ?: return
         viewModelScope.launch {
-            app.cacheManager.preferences.setLastReadNotificationId(newest.id)
+            app.cacheManager.preferences.setLastReadNotificationId(newest.createdAt)
             _hasUnread.value = false
         }
     }

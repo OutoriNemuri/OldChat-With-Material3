@@ -73,6 +73,8 @@ fun ChatScreen(
             (it is EncryptedCallManager.CallState.Establishing && it.peer == friendUid)
     }
     var callOverlayVisible by remember { mutableStateOf(false) }
+    // 挂断确认框状态：必须在下面的通话页分支之前声明（Kotlin 局部变量按声明顺序可见）
+    var showHangUpConfirm by remember { mutableStateOf(false) }
     LaunchedEffect(callActive) {
         // 通话开始 → 自动展开；通话结束 → 收起
         callOverlayVisible = callActive
@@ -104,7 +106,6 @@ fun ChatScreen(
     var inputText by remember { mutableStateOf("") }
     val keyboardController = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
     var showRedPacketDialog by remember { mutableStateOf(false) }
-    var showHangUpConfirm by remember { mutableStateOf(false) }
     // 附件抽屉（+ 号展开，内含图片/文件/红包）
     var showAttachmentDrawer by remember { mutableStateOf(false) }
     // 我的表情抽屉
@@ -360,8 +361,8 @@ fun ChatScreen(
                         if (text.isNotEmpty()) clipboard.setText(AnnotatedString(text))
                     },
                     onQuote = { quoteDraft = message },
-                    modifier = Modifier.animateItem()
                     onBurnOpen = { chatViewModel.openBurnMessage(it) },
+                    modifier = Modifier.animateItem()
                 )
             }
 

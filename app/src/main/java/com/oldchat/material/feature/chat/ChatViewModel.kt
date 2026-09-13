@@ -49,8 +49,9 @@ class ChatViewModel : ViewModel() {
     private var markReadJob: Job? = null
     private var lastReadRequestAt: Long = 0L
 
-    // ALIGN-13：历史分页状态
-    private var isLoadingMore = false
+    // ALIGN-13：历史分页状态（注意：本类已有同名 isLoadingMore 用于旧分页逻辑，
+    // 故这里必须用不同名字，否则 Conflicting declarations）
+    private var isLoadingMoreHistory = false
     private var historyHasMore = true
     private var loadedPages = 1
     private val receiptRefreshTrigger = MutableSharedFlow<Unit>(
@@ -177,7 +178,7 @@ class ChatViewModel : ViewModel() {
         receiptRefreshJob = viewModelScope.launch {
             launch {
                 app.wsManager.connectionState
-                    .map { it == com.oldchat.material.core.network.ConnectionState.CONNECTED }
+                    .map { it == com.oldchat.material.core.network.WebSocketManager.ConnectionState.CONNECTED }
                     .distinctUntilChanged()
                     .filter { it }
                     .collect { triggerReceiptRefresh() }
@@ -918,9 +919,9 @@ class ChatViewModel : ViewModel() {
      * ALIGN-13：向上翻页加载更早历史（进入会话只拉最新一页）。
      */
     fun loadMoreHistory() {
-        if (isLoadingMore || !historyHasMore) return
+        if (isLoadingMoreHistory || !historyHasMore) return
         val oldest = _messages.value.minByOrNull { it.createdAt } ?: return
-        isLoadingMore = true
+        isLoadingMoreHistory = true
         viewModelScope.launch {
             try {
                 if (loadedPages >= MAX_HISTORY_PAGES) {
@@ -951,7 +952,7 @@ class ChatViewModel : ViewModel() {
             } catch (_: Exception) {
                 historyHasMore = false
             } finally {
-                isLoadingMore = false
+                isLoadingMoreHistory = false
             }
         }
     }

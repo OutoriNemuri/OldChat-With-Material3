@@ -226,7 +226,7 @@ class GroupChatViewModel : ViewModel() {
             if (serverSeq < cursor) {
                 cache.preferences.clearGroupSyncWatermark(groupId)
                 watermarkSeq = 0
-                watermarkAnchorId = null
+                watermarkAnchorId = ""
                 pullLegacyUntilOverlap()
                 return
             }

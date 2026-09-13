@@ -77,13 +77,13 @@ fun DiscoverSettingsScreen(onBack: () -> Unit) {
                 title = "OldView 入口",
                 subtitle = "旧版时间线视图",
                 checked = showOldView,
-                onToggle = { scope.launch { preferences.setShowOldViewEntry(it) } }
+                onToggle = { scope.launch { preferences.setShowOldView(it) } }
             )
             SettingSwitch(
                 title = "公开法庭入口",
                 subtitle = "社区仲裁与公示",
                 checked = showPublicCourt,
-                onToggle = { scope.launch { preferences.setShowPublicCourtEntry(it) } }
+                onToggle = { scope.launch { preferences.setShowPublicCourt(it) } }
             )
             Spacer(Modifier.height(24.dp))
             Text(
