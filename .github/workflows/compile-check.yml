@@ -66,6 +66,18 @@ jobs:
         if: success()
         run: find app/build/outputs -name '*.apk' -exec ls -lh {} \;
 
+      # 真机验证用：debug APK 用 CI 自动生成的 debug 签名，可直接安装。
+      - name: Upload APKs
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apks
+          if-no-files-found: ignore
+          retention-days: 14
+          path: |
+            app/build/outputs/apk/debug/*.apk
+            app/build/outputs/apk/release/*.apk
+
       - name: Collect build reports on failure
         if: failure()
         uses: actions/upload-artifact@v4
