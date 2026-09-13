@@ -65,6 +65,38 @@ fun ChatScreen(
     // 加密通话状态（进程级，离开会话页不中断）
     val callState by chatViewModel.callState.collectAsStateWithLifecycle()
     val callElapsedSeconds by chatViewModel.callElapsedSeconds.collectAsStateWithLifecycle()
+
+    // 通话进行中（含握手中）自动进入全屏通话页；点「返回聊天」可收起为顶部状态栏
+    val callActive = callState.let {
+        (it is EncryptedCallManager.CallState.Connected && it.peer == friendUid) ||
+            (it is EncryptedCallManager.CallState.Establishing && it.peer == friendUid)
+    }
+    var callOverlayVisible by remember { mutableStateOf(false) }
+    LaunchedEffect(callActive) {
+        // 通话开始 → 自动展开；通话结束 → 收起
+        callOverlayVisible = callActive
+    }
+    if (callOverlayVisible && callActive) {
+        EncryptedCallScreen(
+            peerName = friendName,
+            state = callState,
+            elapsedSeconds = callElapsedSeconds,
+            onHangUp = { showHangUpConfirm = true },
+            onMinimize = { callOverlayVisible = false }
+        )
+        // 挂断确认框仍要能弹出来
+        if (showHangUpConfirm) {
+            HangUpConfirmDialog(
+                peerName = friendName,
+                onConfirm = {
+                    showHangUpConfirm = false
+                    chatViewModel.hangUpEncryptedCall()
+                },
+                onDismiss = { showHangUpConfirm = false }
+            )
+        }
+        return
+    }
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
@@ -284,7 +316,8 @@ fun ChatScreen(
                 state = callState,
                 elapsedSeconds = callElapsedSeconds,
                 onHangUp = { showHangUpConfirm = true },
-                onDismiss = { chatViewModel.dismissCallResult() }
+                onDismiss = { chatViewModel.dismissCallResult() },
+                onExpand = { callOverlayVisible = true }
             )
         Box(modifier = Modifier.fillMaxSize()) {
         LazyColumn(
@@ -384,19 +417,13 @@ fun ChatScreen(
 
     // 挂断确认（「再次点击并确认后退出」）
     if (showHangUpConfirm) {
-        AlertDialog(
-            onDismissRequest = { showHangUpConfirm = false },
-            title = { Text("结束加密通话") },
-            text = { Text("确认结束与 ${friendName} 的加密通话？双方都会收到结束信号。") },
-            confirmButton = {
-                TextButton(onClick = {
-                    showHangUpConfirm = false
-                    chatViewModel.hangUpEncryptedCall()
-                }) { Text("结束通话") }
+        HangUpConfirmDialog(
+            peerName = friendName,
+            onConfirm = {
+                showHangUpConfirm = false
+                chatViewModel.hangUpEncryptedCall()
             },
-            dismissButton = {
-                TextButton(onClick = { showHangUpConfirm = false }) { Text("继续通话") }
-            }
+            onDismiss = { showHangUpConfirm = false }
         )
     }
 
@@ -1465,7 +1492,8 @@ private fun EncryptedCallBar(
     state: EncryptedCallManager.CallState,
     elapsedSeconds: Long,
     onHangUp: () -> Unit,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    onExpand: () -> Unit = {}
 ) {
     when (state) {
         is EncryptedCallManager.CallState.Idle -> Unit
@@ -1504,6 +1532,7 @@ private fun EncryptedCallBar(
                         overflow = TextOverflow.Ellipsis
                     )
                 }
+                TextButton(onClick = onExpand) { Text("通话页面") }
                 TextButton(onClick = onHangUp) { Text("挂断") }
             }
         }
@@ -1551,4 +1580,174 @@ private fun formatCallDuration(seconds: Long): String {
     val m = (seconds % 3600) / 60
     val s = seconds % 60
     return if (h > 0) "%d:%02d:%02d".format(h, m, s) else "%02d:%02d".format(m, s)
+}
+
+/**
+ * 全屏加密通话页。
+ *
+ * 只展示「加密会话本身」的可验证信息：算法、密钥指纹（双方一致即握手成功）、通话时长。
+ * 本版不含音频管线，所以页面上不出现「麦克风/扬声器」这类会误导的控件。
+ */
+@Composable
+private fun EncryptedCallScreen(
+    peerName: String,
+    state: EncryptedCallManager.CallState,
+    elapsedSeconds: Long,
+    onHangUp: () -> Unit,
+    onMinimize: () -> Unit
+) {
+    val connected = state as? EncryptedCallManager.CallState.Connected
+    val establishing = state as? EncryptedCallManager.CallState.Establishing
+
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = MaterialTheme.colorScheme.surface
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .navigationBarsPadding()
+                .statusBarsPadding()
+                .padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Spacer(Modifier.height(32.dp))
+
+            Surface(
+                shape = androidx.compose.foundation.shape.CircleShape,
+                color = MaterialTheme.colorScheme.primaryContainer,
+                modifier = Modifier.size(96.dp)
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        Icons.Filled.Lock,
+                        contentDescription = null,
+                        modifier = Modifier.size(44.dp),
+                        tint = MaterialTheme.colorScheme.onPrimaryContainer
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(20.dp))
+            Text(peerName.ifBlank { "对方" }, style = MaterialTheme.typography.headlineSmall)
+            Spacer(Modifier.height(8.dp))
+
+            Text(
+                when {
+                    connected != null -> "加密通话中"
+                    establishing != null -> "正在建立加密通话…"
+                    else -> "通话已结束"
+                },
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.primary
+            )
+
+            Spacer(Modifier.height(6.dp))
+            Text(
+                connected?.let { formatCallDuration(elapsedSeconds) }
+                    ?: (establishing?.kem ?: ""),
+                style = MaterialTheme.typography.displaySmall
+            )
+
+            Spacer(Modifier.height(24.dp))
+
+            // 握手可验证信息
+            Surface(
+                shape = RoundedCornerShape(12.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(Modifier.padding(16.dp)) {
+                    CallInfoRow("密钥封装算法", connected?.kem ?: establishing?.kem ?: "-")
+                    CallInfoRow(
+                        "共享密钥指纹",
+                        connected?.fingerprint ?: "握手中…"
+                    )
+                    CallInfoRow(
+                        "密钥来源",
+                        when {
+                            connected == null -> "-"
+                            connected.persisted -> "本地共享密钥（可跨通话复用）"
+                            else -> "本次握手生成"
+                        }
+                    )
+                    CallInfoRow("角色", if (connected != null) {
+                        if (connected.role == EncryptedCallManager.Role.INITIATOR) "发起方" else "响应方"
+                    } else "-")
+                }
+            }
+
+            Spacer(Modifier.weight(1f))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    FilledTonalIconButton(onClick = onMinimize, modifier = Modifier.size(56.dp)) {
+                        Icon(Icons.Filled.KeyboardArrowDown, "返回聊天")
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    Text("返回聊天", style = MaterialTheme.typography.labelMedium)
+                }
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    FilledIconButton(
+                        onClick = onHangUp,
+                        modifier = Modifier.size(72.dp),
+                        colors = IconButtonDefaults.filledIconButtonColors(
+                            containerColor = MaterialTheme.colorScheme.error
+                        )
+                    ) {
+                        Icon(Icons.Filled.CallEnd, "结束通话", modifier = Modifier.size(30.dp))
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    Text("结束通话", style = MaterialTheme.typography.labelMedium)
+                }
+            }
+
+            Spacer(Modifier.height(24.dp))
+        }
+    }
+}
+
+@Composable
+private fun CallInfoRow(label: String, value: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            label,
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.width(96.dp)
+        )
+        Text(
+            value,
+            style = MaterialTheme.typography.bodyMedium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
+/** 挂断前的确认框（单聊抽屉按钮与通话页共用）。 */
+@Composable
+private fun HangUpConfirmDialog(
+    peerName: String,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("结束加密通话") },
+        text = { Text("确认结束与 ${peerName.ifBlank { "对方" }} 的加密通话？双方都会收到结束信号。") },
+        confirmButton = {
+            TextButton(onClick = onConfirm) { Text("结束通话") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("继续通话") }
+        }
+    )
 }

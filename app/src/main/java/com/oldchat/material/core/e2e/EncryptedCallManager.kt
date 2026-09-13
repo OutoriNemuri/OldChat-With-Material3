@@ -95,6 +95,7 @@ class EncryptedCallManager(
     private var lastFrameAt = 0L
     private var timerJob: Job? = null
     private var heartbeatJob: Job? = null
+    private var handshakeJob: Job? = null
 
     /** 当前使用的 KEM（UI/日志用它说明到底跑的是 ML-KEM-768 还是降级方案） */
     val activeKemId: String get() = callKem.id
@@ -149,6 +150,18 @@ class EncryptedCallManager(
         pendingPrivateKey = pair.privateKey
         _state.value = CallState.Establishing(peer, Role.INITIATOR, now, callKem.id)
         _systemText.value = "已发起加密通话，正在握手…"
+
+        // 对端离线/未响应时不能永远停在「握手中」——超时即结束（对称：两端行为一致）
+        handshakeJob?.cancel()
+        handshakeJob = scope.launch {
+            delay(HANDSHAKE_TIMEOUT_MS)
+            val s = _state.value
+            if (s is CallState.Establishing && s.role == Role.INITIATOR) {
+                pendingPrivateKey = null
+                _state.value = CallState.Ended(peer, "对方未响应，加密通话未建立", System.currentTimeMillis())
+                _systemText.value = "对方未响应"
+            }
+        }
         scope.launch {
             val ok = sendRaw(peer, E2eFrame.encode(E2eFrame.Kind.PQC_BEGIN, pair.publicKey))
             if (!ok) {
@@ -277,6 +290,7 @@ class EncryptedCallManager(
             fingerprint = E2eFingerprint.of(ss),
             persisted = true
         )
+        handshakeJob?.cancel(); handshakeJob = null
         _systemText.value = "与 $fromUid 握手完成（发起方），加密通话已建立"
         startTimers()
     }
@@ -361,6 +375,7 @@ class EncryptedCallManager(
     private fun stopTimers() {
         timerJob?.cancel(); timerJob = null
         heartbeatJob?.cancel(); heartbeatJob = null
+        handshakeJob?.cancel(); handshakeJob = null
         _elapsedSeconds.value = 0L
     }
 
@@ -394,6 +409,9 @@ class EncryptedCallManager(
         private const val TAG = "EncryptedCall"
         private const val HEARTBEAT_INTERVAL_MS = 15_000L
         private const val HEARTBEAT_TIMEOUT_MS = 45_000L
+
+        /** 发起方等待 PQC_REPLY 的上限 */
+        private const val HANDSHAKE_TIMEOUT_MS = 30_000L
     }
 }
 
