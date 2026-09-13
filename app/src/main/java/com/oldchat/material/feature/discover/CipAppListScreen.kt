@@ -68,7 +68,9 @@ fun CipAppListScreen(
             isLoading = isOpening,
             error = openError,
             embedded = embedded,
-            onClose = { cipViewModel.closeApp() }
+            onClose = { cipViewModel.closeApp() },
+            // BUG-11：把控件点击转成 Lua 回调调用，并把新页面写回
+            onNodeClick = { nodeId -> cipViewModel.onNodeClick(nodeId) }
         )
         return
     }
@@ -166,7 +168,8 @@ private fun CipMiniAppViewer(
     isLoading: Boolean,
     error: String?,
     embedded: Boolean,
-    onClose: () -> Unit
+    onClose: () -> Unit,
+    onNodeClick: (String) -> Unit = {}
 ) {
     if (embedded) {
         // 内嵌模式：无自己的顶栏，直接渲染内容
@@ -182,7 +185,7 @@ private fun CipMiniAppViewer(
                     Button(onClick = onClose) { Text("返回") }
                 }
             }
-            page != null -> renderPage(page)
+            page != null -> renderPage(page, onNodeClick)
         }
         return
     }
@@ -216,7 +219,7 @@ private fun CipMiniAppViewer(
                     Spacer(Modifier.height(12.dp))
                     Button(onClick = onClose) { Text("返回") }
                 }
-                page != null -> renderPage(page)
+                page != null -> renderPage(page, onNodeClick)
             }
         }
     }
@@ -224,7 +227,7 @@ private fun CipMiniAppViewer(
 
 /** 渲染 ui.page 控件树。 */
 @Composable
-private fun renderPage(page: LuaMiniAppEngine.Page) {
+private fun renderPage(page: LuaMiniAppEngine.Page, onNodeClick: (String) -> Unit = {}) {
     Column(
         Modifier
             .fillMaxSize()
@@ -237,13 +240,13 @@ private fun renderPage(page: LuaMiniAppEngine.Page) {
             Spacer(Modifier.height(12.dp))
         }
         page.children.forEach { node ->
-            renderNode(node)
+            renderNode(node, onNodeClick)
         }
     }
 }
 
 @Composable
-private fun renderNode(node: LuaMiniAppEngine.Node) {
+private fun renderNode(node: LuaMiniAppEngine.Node, onNodeClick: (String) -> Unit = {}) {
     when (node) {
         is LuaMiniAppEngine.Node.Text -> {
             Text(
@@ -256,7 +259,8 @@ private fun renderNode(node: LuaMiniAppEngine.Node) {
             Spacer(Modifier.height(4.dp))
         }
         is LuaMiniAppEngine.Node.Button -> {
-            Button(onClick = { /* Lua on_click 闭包暂未桥接为可点击动作 */ }) {
+            // BUG-11：on_click 已桥接 —— 点击后调用 Lua 回调并按新的 set_text 重解析页面
+            Button(onClick = { node.id?.let(onNodeClick) }) {
                 Text(node.text)
             }
             Spacer(Modifier.height(8.dp))
@@ -266,7 +270,7 @@ private fun renderNode(node: LuaMiniAppEngine.Node) {
         }
         is LuaMiniAppEngine.Node.Group -> {
             Column(Modifier.padding(start = 8.dp)) {
-                node.children.forEach { renderNode(it) }
+                node.children.forEach { renderNode(it, onNodeClick) }
             }
         }
     }
@@ -361,6 +365,22 @@ class CipViewModel : ViewModel() {
     val openedScript: StateFlow<String?> = _openedScript.asStateFlow()
 
     // 执行脚本后得到的页面模型（真实渲染）
+    // BUG-11：单个小程序一个常驻引擎实例（on_click 回调必须与页面同寿命）
+    private var engine: LuaMiniAppEngine? = null
+    private var activeEngine: LuaMiniAppEngine? = null
+
+    /** 控件点击 → 调用 Lua on_click → 用新的 set_text 值重绘。 */
+    fun onNodeClick(nodeId: String) {
+        val engineRef = activeEngine ?: return
+        viewModelScope.launch {
+            try {
+                engineRef.invokeClick(nodeId)?.let { _openedPage.value = it }
+            } catch (e: Exception) {
+                _openError.value = "操作失败：${e.message ?: e.javaClass.simpleName}"
+            }
+        }
+    }
+
     private val _openedPage = MutableStateFlow<LuaMiniAppEngine.Page?>(null)
     val openedPage: StateFlow<LuaMiniAppEngine.Page?> = _openedPage.asStateFlow()
 
@@ -416,9 +436,24 @@ class CipViewModel : ViewModel() {
                             _openError.value = "未获取到脚本内容"
                         } else {
                             _openedScript.value = script
-                            // 用 Lua 引擎真实执行 main.lua，得到页面描述
+                            // BUG-11：保留同一个引擎实例（原来每次新建，
+                            // on_click 回调注册在旧实例上 → 点击永远没反应），
+                            // 并把同服务器 GET 桥接给 app.http_get。
+                            engine?.destroy()
+                            engine = LuaMiniAppEngine(
+                                context = app,
+                                appId = appId,
+                                sameServerGet = { path ->
+                                    // 在 Lua 线程上同步等待，宿主注入登录令牌
+                                    runCatching {
+                                        kotlinx.coroutines.runBlocking {
+                                            app.apiClient.get(path, emptyMap()).getOrNull()
+                                        }
+                                    }.getOrNull()
+                                }
+                            ).also { activeEngine = it }
                             try {
-                                _openedPage.value = LuaMiniAppEngine().run(script)
+                                _openedPage.value = activeEngine?.run(script)
                             } catch (e: Exception) {
                                 _openError.value = "脚本执行失败：${e.message ?: e.javaClass.simpleName}"
                             }
@@ -439,6 +474,9 @@ class CipViewModel : ViewModel() {
         _openedPage.value = null
         _openedAppName.value = ""
         _openError.value = null
+        // BUG-11：释放引擎（含延时任务线程）
+        activeEngine?.destroy()
+        activeEngine = null
     }
 
     /**
