@@ -351,12 +351,14 @@ class GroupChatViewModel : ViewModel() {
     private fun mergeGroupMessages(incoming: List<GroupMessage>, appendToFront: Boolean) {
         // 核心防御：只合并属于当前群的消息。任何来源（历史补全/WS/HTTP轮询/缓存）
         // 若 groupId 与当前群不一致就丢弃，杜绝「串群」。
-        // 加密通话控制帧（PQC_BEGIN / PQC_REPLY / ENC）不是聊天消息：
-        // 单聊的帧不该出现在群聊记录里，历史回源时一并过滤。
-        val filtered = incoming.filter {
-            (it.groupId.isEmpty() || it.groupId == groupId) &&
-                !com.oldchat.material.core.e2e.E2eFrame.isE2e(it.body)
+        // 加密通话的帧：控制帧丢弃；ENC 消息帧解出明文（虽然通话是单聊功能，
+        // 但同一套帧格式也可能出现在群消息里，统一处理避免显示成一串 base64）。
+        val callManager = OldChatApplication.instance.encryptedCallManager
+        val normalized = incoming.mapNotNull { m ->
+            val plain = callManager.unwrapForDisplay(m.body, m.fromUid) ?: return@mapNotNull null
+            if (plain == m.body) m else m.copy(body = plain)
         }
+        val filtered = normalized.filter { it.groupId.isEmpty() || it.groupId == groupId }
         if (filtered.isEmpty()) return
 
         val current = _messages.value.toMutableList()

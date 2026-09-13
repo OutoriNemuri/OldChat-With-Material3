@@ -65,6 +65,7 @@ fun ChatScreen(
     // 加密通话状态（进程级，离开会话页不中断）
     val callState by chatViewModel.callState.collectAsStateWithLifecycle()
     val callElapsedSeconds by chatViewModel.callElapsedSeconds.collectAsStateWithLifecycle()
+    val callQueueHint by chatViewModel.callQueueHint.collectAsStateWithLifecycle()
 
     // 通话进行中（含握手中）自动进入全屏通话页；点「返回聊天」可收起为顶部状态栏
     val callActive = callState.let {
@@ -315,6 +316,7 @@ fun ChatScreen(
             EncryptedCallBar(
                 state = callState,
                 elapsedSeconds = callElapsedSeconds,
+                queueHint = callQueueHint,
                 onHangUp = { showHangUpConfirm = true },
                 onDismiss = { chatViewModel.dismissCallResult() },
                 onExpand = { callOverlayVisible = true }
@@ -697,6 +699,16 @@ private fun MessageBubble(
                                 verticalAlignment = Alignment.CenterVertically,
                                 modifier = Modifier.padding(top = 2.dp)
                             ) {
+                                // 加密通话内的消息：加一把小锁（本地标记，非服务端字段）
+                                if (message.encrypted) {
+                                    Icon(
+                                        Icons.Filled.Lock,
+                                        contentDescription = "端到端加密发送",
+                                        modifier = Modifier.size(10.dp),
+                                        tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.8f)
+                                    )
+                                    Spacer(Modifier.width(3.dp))
+                                }
                                 Text(
                                     formatMessageTime(message.createdAt),
                                     style = MaterialTheme.typography.labelSmall,
@@ -1491,6 +1503,7 @@ private fun BurnMessageBubble(
 private fun EncryptedCallBar(
     state: EncryptedCallManager.CallState,
     elapsedSeconds: Long,
+    queueHint: String? = null,
     onHangUp: () -> Unit,
     onDismiss: () -> Unit,
     onExpand: () -> Unit = {}
@@ -1505,9 +1518,11 @@ private fun EncryptedCallBar(
                 Column(Modifier.weight(1f)) {
                     Text("正在建立加密通话…", style = MaterialTheme.typography.labelLarge)
                     Text(
-                        "握手算法：${state.kem}",
+                        queueHint ?: "握手算法：${state.kem}",
                         style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
                 TextButton(onClick = onHangUp) { Text("取消") }

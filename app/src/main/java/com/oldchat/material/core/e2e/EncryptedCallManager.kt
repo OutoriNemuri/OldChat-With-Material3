@@ -75,6 +75,23 @@ class EncryptedCallManager(
 
     enum class Role { INITIATOR, RESPONDER }
 
+    /**
+     * 入站帧的分流结果（由网络层在**派发之前**决定，避免帧进入消息流）。
+     */
+    sealed interface Inbound {
+        /** 不是 E2E 帧：按普通消息继续派发 */
+        data object NotE2e : Inbound
+
+        /** 已被通话层消费（握手帧 / ENC 控制帧）：不要派发 */
+        data object Consumed : Inbound
+
+        /** ENC 帧里装的是普通消息：用 [Message.plainBody] 作为 body 继续派发 */
+        data class Message(val plainBody: String) : Inbound
+
+        /** 是 E2E 帧但解不开（无密钥/认证失败）：丢弃，不要派发 */
+        data object Undecryptable : Inbound
+    }
+
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     private val _state = MutableStateFlow<CallState>(CallState.Idle)
@@ -171,6 +188,78 @@ class EncryptedCallManager(
         }
     }
 
+    // ---- 通话内普通消息的加解密（enigmaj 的「发消息入口：查密钥→加密→发送」） ----
+
+    /** 当前是否与该对端处于「已接通」状态（只有这时才有可用密钥） */
+    fun isConnectedWith(peer: String): Boolean =
+        (_state.value as? CallState.Connected)?.peer == peer
+
+    /** 是否正在与对端握手（此时还没有密钥，消息需要暂存） */
+    fun isEstablishingWith(peer: String): Boolean =
+        (_state.value as? CallState.Establishing)?.peer == peer
+
+    /**
+     * 把明文消息体（v2 JSON 或任意文本）包成 `ENC\n<base64(nonce12‖AES-GCM(plain)‖tag16)>`。
+     *
+     * 返回 null 表示「当前没有可用密钥」——调用方应按原样明文发送（enigmaj 也没有
+     * 「必须加密」的强制策略）。
+     */
+    fun wrapMessage(peer: String, plainBody: String): String? {
+        if (!isConnectedWith(peer)) return null
+        val ss = sessionSecret ?: return null
+        val payload = E2eAead.encrypt(ss, plainBody.toByteArray(Charsets.UTF_8)) ?: return null
+        return E2eFrame.encode(E2eFrame.Kind.ENC, payload)
+    }
+
+    /**
+     * 展示/入库用的解包：非 E2E 原样返回；ENC 消息帧返回明文；
+     * 握手帧、ENC 控制帧、解不开的帧一律返回 null（表示「不该出现在消息列表里」）。
+     *
+     * 用在历史回源路径（`mergeMessages`）——WS 路径已在网络层解包。
+     */
+    fun unwrapForDisplay(body: String, peer: String): String? {
+        if (!E2eFrame.isE2e(body)) return body
+        if (E2eFrame.kind(body) != E2eFrame.Kind.ENC) return null
+        val ss = sessionSecret ?: keyStore.get(peer) ?: return null
+        val payload = runCatching {
+            Base64.decode(E2eFrame.payloadOf(body, E2eFrame.Kind.ENC), Base64.NO_WRAP)
+        }.getOrNull() ?: return null
+        val plain = E2eAead.decrypt(ss, payload) ?: return null
+        val text = String(plain, Charsets.UTF_8)
+        val isControl = runCatching { JSONObject(text).has("t") }.getOrDefault(false)
+        return if (isControl) null else text
+    }
+
+    /**
+     * 入站分流（网络层单点调用，**必须发生在派发之前**）。
+     * @param selfEcho 该帧是不是自己发出的回显（fromUid == 我的 uid）
+     */
+    fun onInbound(body: String, fromUid: String, selfEcho: Boolean): Inbound {
+        val kind = E2eFrame.kind(body)
+        if (kind == E2eFrame.Kind.PLAIN) return Inbound.NotE2e
+        lastFrameAt = System.currentTimeMillis()
+
+        if (selfEcho) {
+            // 自己发出的帧：握手帧丢弃；ENC 消息帧解包后交回消息流
+            // （用于把本地 pending 替换成服务端确认的真实消息）
+            val plain = unwrapForDisplay(body, fromUid)
+            return if (plain != null) Inbound.Message(plain) else Inbound.Consumed
+        }
+
+        return when (kind) {
+            E2eFrame.Kind.PQC_BEGIN -> {
+                handlePqcBegin(E2eFrame.payloadOf(body, kind), fromUid)
+                Inbound.Consumed
+            }
+            E2eFrame.Kind.PQC_REPLY -> {
+                handlePqcReply(E2eFrame.payloadOf(body, kind), fromUid)
+                Inbound.Consumed
+            }
+            E2eFrame.Kind.ENC -> handleEncFrame(E2eFrame.payloadOf(body, kind), fromUid)
+            E2eFrame.Kind.PLAIN -> Inbound.NotE2e
+        }
+    }
+
     // ---- 挂断（"再次点击并确认后退出"） ----
 
     fun hangUp(reason: String = "已结束加密通话") {
@@ -203,31 +292,6 @@ class EncryptedCallManager(
 
     // ---- 入站帧 ----
 
-    /**
-     * 处理一条可能是 E2E 帧的入站消息。
-     * @return true 表示该消息已被通话层消费（不应作为普通聊天消息展示/入库）
-     */
-    fun handleIncoming(body: String, fromUid: String): Boolean {
-        val kind = E2eFrame.kind(body)
-        if (kind == E2eFrame.Kind.PLAIN) return false
-        lastFrameAt = System.currentTimeMillis()
-
-        return when (kind) {
-            E2eFrame.Kind.PQC_BEGIN -> {
-                handlePqcBegin(E2eFrame.payloadOf(body, kind), fromUid)
-                true
-            }
-            E2eFrame.Kind.PQC_REPLY -> {
-                handlePqcReply(E2eFrame.payloadOf(body, kind), fromUid)
-                true
-            }
-            E2eFrame.Kind.ENC -> {
-                handleEnc(E2eFrame.payloadOf(body, kind), fromUid)
-                true
-            }
-            E2eFrame.Kind.PLAIN -> false
-        }
-    }
 
     /** 响应方：收到对方公钥立即封装并回 PQC_REPLY（enigmaj 的自动应答行为） */
     private fun handlePqcBegin(payloadB64: String, fromUid: String) {
@@ -295,25 +359,33 @@ class EncryptedCallManager(
         startTimers()
     }
 
-    /** 通话中的 ENC 控制帧：ping / pong / end / start */
-    private fun handleEnc(payloadB64: String, fromUid: String) {
+    /**
+     * 通话中的 ENC 帧分流：
+     * - 载荷是控制帧（JSON 含 `t`）→ 通话层处理，返回 [Inbound.Consumed]
+     * - 载荷是普通消息体（v2 JSON 等）→ 返回 [Inbound.Message]，交回消息流展示
+     */
+    private fun handleEncFrame(payloadB64: String, fromUid: String): Inbound {
         val ss = sessionSecret
         if (ss == null) {
             // enigmaj 原文案：「收到来自 X 的加密消息，但无共享密钥」
             _systemText.value = "收到来自 $fromUid 的加密消息，但没有共享密钥"
-            return
+            return Inbound.Undecryptable
         }
         val payload = runCatching { Base64.decode(payloadB64, Base64.NO_WRAP) }.getOrNull()
-            ?: return
+            ?: return Inbound.Undecryptable
         val plain = E2eAead.decrypt(ss, payload)
         if (plain == null) {
             // 长度不足 / 认证失败（enigmaj：密文长度不足 / 解密失败）
             Log.w(TAG, "ENC 帧解密失败（长度不足或 MAC 校验不通过）")
-            return
+            return Inbound.Undecryptable
         }
 
-        val type = runCatching { JSONObject(String(plain, Charsets.UTF_8)).optString("t") }
-            .getOrDefault("")
+        val text = String(plain, Charsets.UTF_8)
+        val type = runCatching { JSONObject(text).optString("t") }.getOrDefault("")
+        if (type.isEmpty()) {
+            // 不是控制帧 → 这是一条「通话内加密消息」
+            return Inbound.Message(text)
+        }
         when (type) {
             "ping" -> scope.launch { peerUid?.let { sendControl(it, "pong") } }
             "pong" -> lastFrameAt = System.currentTimeMillis()
@@ -341,6 +413,7 @@ class EncryptedCallManager(
             }
             else -> Log.d(TAG, "忽略未知控制帧: $type")
         }
+        return Inbound.Consumed
     }
 
     // ---- 定时器 ----

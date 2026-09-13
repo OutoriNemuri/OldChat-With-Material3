@@ -134,10 +134,11 @@ class WebSocketManager(
      */
     fun emitHttpDirectMessage(message: Message) {
         if (message.fromUid.isEmpty()) return
-        scope.launch { _directMessages.emit(message) }
+        val body = e2eDispatchBody(message.body, message.fromUid) ?: return
+        val out = if (body != message.body) message.copy(body = body, encrypted = true) else message
+        scope.launch { _directMessages.emit(out) }
         // BUG-09 / ALIGN-06：轮询拉到的消息同样要出通知
-        runCatching { NotificationHelper.notifyDirect(message) }
-        routeE2eFrame(message.body, message.fromUid)
+        runCatching { NotificationHelper.notifyDirect(out) }
     }
 
     /**
@@ -284,20 +285,28 @@ class WebSocketManager(
     }
 
     /**
-     * 加密通话的控制帧（PQC_BEGIN / PQC_REPLY / ENC）在这里**统一消费**。
+     * 加密通话帧的**派发前分流**（网络层单点）。所有入站直聊消息
+     * （WS 推送 与 HTTP 轮询注入）都经过这里。
      *
      * 放在网络层的原因：呼叫必须在任何界面下都能被接起 —— 若挂在 ChatViewModel
      * （只在打开该会话时存在），对方不在会话页就永远接不到来电。
-     * 所有入站直聊消息（WS 推送与 HTTP 轮询注入）都经过这个方法。
+     *
+     * @return 需要继续派发的 body；null 表示该帧已被通话层消费（或解不开），
+     *         不应进入消息流（气泡/预览/通知/缓存）。
      */
-    private fun routeE2eFrame(body: String, fromUid: String) {
-        if (!com.oldchat.material.core.e2e.E2eFrame.isE2e(body)) return
-        val myUid = authManager.myUid
-        // 自己发出的帧会被回显，不能当成对方来电
-        if (myUid != null && fromUid == myUid) return
-        runCatching {
+    private fun e2eDispatchBody(body: String, fromUid: String): String? {
+        if (!com.oldchat.material.core.e2e.E2eFrame.isE2e(body)) return body
+        val manager = runCatching {
             com.oldchat.material.OldChatApplication.instance.encryptedCallManager
-                .handleIncoming(body, fromUid)
+        }.getOrNull() ?: return body
+
+        val myUid = authManager.myUid
+        return when (val inbound = manager.onInbound(body, fromUid, fromUid == myUid)) {
+            is com.oldchat.material.core.e2e.EncryptedCallManager.Inbound.NotE2e -> body
+            // 通话内的加密消息：用解密后的明文继续走正常消息管线
+            is com.oldchat.material.core.e2e.EncryptedCallManager.Inbound.Message -> inbound.plainBody
+            com.oldchat.material.core.e2e.EncryptedCallManager.Inbound.Consumed -> null
+            com.oldchat.material.core.e2e.EncryptedCallManager.Inbound.Undecryptable -> null
         }
     }
 
@@ -426,10 +435,20 @@ class WebSocketManager(
                 "direct_message", "new_message", "message", "DIRECT_MESSAGE_NEW" -> {
                     val message = gson.fromJson(payload, Message::class.java)
                     if (message != null && message.fromUid.isNotEmpty()) {
-                        scope.launch { _directMessages.emit(message) }
-                        // BUG-09 / ALIGN-06：新消息系统通知
-                        runCatching { NotificationHelper.notifyDirect(message) }
-                        routeE2eFrame(message.body, message.fromUid)
+                        // 加密通话的帧在这里分流：控制帧被消费，加密消息解包成明文
+                        val body = e2eDispatchBody(message.body, message.fromUid)
+                        if (body == null) {
+                            // 被通话层消费（握手/心跳/挂断），不进消息流
+                        } else {
+                            val out = if (body != message.body) {
+                                message.copy(body = body, encrypted = true)
+                            } else {
+                                message
+                            }
+                            scope.launch { _directMessages.emit(out) }
+                            // BUG-09 / ALIGN-06：新消息系统通知
+                            runCatching { NotificationHelper.notifyDirect(out) }
+                        }
                     }
                 }
                 // ---- 群消息 ----

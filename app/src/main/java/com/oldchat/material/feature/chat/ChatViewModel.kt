@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.google.gson.Gson
 import com.oldchat.material.OldChatApplication
 import com.oldchat.material.core.e2e.E2eFrame
+import com.oldchat.material.core.e2e.EncryptedCallManager
 import com.oldchat.material.core.model.Message
 import com.oldchat.material.core.network.TypingEvent
 import com.oldchat.material.core.model.MessagePayloadBuilder
@@ -137,6 +138,18 @@ class ChatViewModel : ViewModel() {
         }
 
         loadMyAvatar()
+
+        // 加密通话状态变化 → 处理「握手中暂存」的消息
+        viewModelScope.launch {
+            callManager.state.collect { st ->
+                when {
+                    st is EncryptedCallManager.CallState.Connected && st.peer == friendUid ->
+                        flushCallQueue()          // 密钥就绪：按加密发送
+                    st is EncryptedCallManager.CallState.Ended && queuedWhileCalling.isNotEmpty() ->
+                        flushCallQueue()          // 通话没成：不丢消息，按明文补发
+                }
+            }
+        }
 
         // ALIGN-15：订阅 typing 事件
         viewModelScope.launch {
@@ -435,16 +448,20 @@ class ChatViewModel : ViewModel() {
      * Merge incoming messages into existing list (merge not replace).
      * Mirrors DirectMessageMerger.mergeRefresh from original §3.4.
      */
-    private fun mergeMessages(incoming: List<Message>, appendToFront: Boolean = true) {
+    private fun mergeMessages(incomingRaw: List<Message>, appendToFront: Boolean = true) {
         val current = _messages.value.toMutableList()
         var changed = false
 
-        for (msg in incoming) {
-            // 加密通话的控制帧不属于「聊天消息」：历史回源（loadHistory / refreshLatest）与
-            // WS 推送共用这里，若不在此过滤，重新进入会话时会把 PQC_BEGIN/PQC_REPLY/ENC
-            // 当成气泡显示出来（WS 路径已在 onWsMessage 提前 return，这里是兜底）。
-            if (E2eFrame.isE2e(msg.body)) continue
+        // 消息体归一化：加密通话的帧在这里一次性处理 ——
+        //   · 控制帧（PQC_BEGIN/PQC_REPLY/ENC 控制帧）→ 丢弃，不该出现在消息列表里
+        //   · ENC 消息帧 → 解包成明文后照常合并展示（历史回源/轮询/WS 都会经过这里）
+        val incoming = incomingRaw.mapNotNull { msg ->
+            val plain = callManager.unwrapForDisplay(msg.body, friendUid) ?: return@mapNotNull null
+            if (plain == msg.body) msg else msg.copy(body = plain, encrypted = true)
+        }
+        if (incoming.isEmpty()) return
 
+        for (msg in incoming) {
             // 已存在消息（非本地临时消息）：更新 read/delivered 状态（已读回执实时刷新），
             // 而不是直接跳过。这样对方读取后，我们发出的消息能实时显示「已读」。
             if (messageIds.contains(msg.id)) {
@@ -523,10 +540,45 @@ class ChatViewModel : ViewModel() {
     fun sendText(text: String, quoteDraft: Message? = null) {
         if (text.isBlank()) return
 
+        // 加密通话中：消息体先加密成 ENC 帧再走同一个 /direct/send
+        // （enigmaj 的发消息入口就是「查密钥 → 加密 → 发送」，通道不变）
+        when {
+            callManager.isConnectedWith(friendUid) -> Unit // 有密钥，下面直接加密发
+            callManager.isEstablishingWith(friendUid) -> {
+                // 还握手中（没有密钥）：先入队，接通后自动加密补发；若通话失败则明文补发，
+                // 保证用户输入不丢。
+                queuedWhileCalling += text to quoteDraft
+                _callQueueHint.value = "正在建立加密通道，${queuedWhileCalling.size} 条消息将在接通后加密发送"
+                return
+            }
+            else -> Unit // 未通话：明文（与 enigmaj 的「没有必须加密的策略」一致）
+        }
+
+        sendTextInternal(text, quoteDraft)
+    }
+
+    /** 通话期暂存待发文本（密钥就绪或通话结束后统一处理） */
+    private val queuedWhileCalling = mutableListOf<Pair<String, Message?>>()
+    private val _callQueueHint = MutableStateFlow<String?>(null)
+    val callQueueHint: StateFlow<String?> = _callQueueHint.asStateFlow()
+
+    private fun flushCallQueue() {
+        if (queuedWhileCalling.isEmpty()) return
+        val batch = queuedWhileCalling.toList()
+        queuedWhileCalling.clear()
+        _callQueueHint.value = null
+        batch.forEach { (t, q) -> sendTextInternal(t, q) }
+    }
+
+    private fun sendTextInternal(text: String, quoteDraft: Message? = null) {
         val body = MessagePayloadBuilder.buildBody(
             text = text,
             quote = quoteDraft?.let { MessagePayloadBuilder.buildQuote(it) }
         )
+
+        // 已接通 → 包成 ENC 帧；没有密钥则原样明文
+        val frame = callManager.wrapMessage(friendUid, body)
+        val wireBody = frame ?: body
 
         val localId = "local_${localIdCounter.incrementAndGet()}"
 
@@ -540,7 +592,8 @@ class ChatViewModel : ViewModel() {
             createdAt = System.currentTimeMillis() / 1000,
             status = Message.STATUS_NONE,
             isLocalPending = true,
-            localRequestId = localId
+            localRequestId = localId,
+            encrypted = frame != null
         )
 
         // Add to list immediately
@@ -554,14 +607,18 @@ class ChatViewModel : ViewModel() {
                 body = gson.toJson(
                     mapOf(
                         "to_uid" to friendUid,
-                        "body" to body,
+                        "body" to wireBody,
                         "msg_type" to "text"
                     )
                 )
             )
             result.fold(
                 onSuccess = { responseBody ->
-                    val sent = parseSingleMessage(responseBody)
+                    // 服务端确认里带的是 ENC 帧（wireBody），本地展示要用明文 body
+                    val sent = parseSingleMessage(responseBody)?.copy(
+                        body = body,
+                        encrypted = frame != null
+                    )
                     if (sent != null) {
                         completePending(localId, sent)
                     } else {
