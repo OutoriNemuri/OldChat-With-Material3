@@ -23,6 +23,7 @@ media3 = "1.2.0"
 luaj = "3.0.1"
 
 [libraries]
+bouncycastle = { group = "org.bouncycastle", name = "bcprov-jdk18on", version = "1.78.1" }
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
 junit = { group = "junit", name = "junit", version.ref = "junit" }
 androidx-junit = { group = "androidx.test.ext", name = "junit", version.ref = "junitVersion" }

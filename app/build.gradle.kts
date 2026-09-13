@@ -105,6 +105,11 @@ dependencies {
     implementation(libs.androidx.material.icons.core)
     implementation(libs.androidx.material.icons.extended)
 
+    // 加密通话：ML-KEM-768（FIPS 203）——与 enigmaj 相同的 KEM。
+    // 代码里通过反射调用 BC 的 mlkem 包，因此即使此依赖缺失也只是自动降级为
+    // ECDH P-256（帧格式不变），不会编译/运行失败。
+    implementation(libs.bouncycastle)
+
     // BUG-25：navigation-compose 全工程零引用（页面切换是自己写的状态机），
     // 保留会让 R8 之外还多一份运行时依赖，直接移除。
     // implementation(libs.androidx.navigation.compose)

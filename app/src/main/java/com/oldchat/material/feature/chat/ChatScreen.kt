@@ -36,6 +36,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import com.oldchat.material.core.notify.AppForeground
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
+import com.oldchat.material.core.e2e.EncryptedCallManager
 import com.oldchat.material.core.model.Message
 import com.oldchat.material.core.model.MessagePayloadBuilder
 import kotlinx.coroutines.delay
@@ -61,12 +62,16 @@ fun ChatScreen(
     val messages by chatViewModel.messages.collectAsStateWithLifecycle()
     val myAvatarUrl by chatViewModel.myAvatarUrl.collectAsStateWithLifecycle()
     val isPeerTyping by chatViewModel.isPeerTyping.collectAsStateWithLifecycle()
+    // 加密通话状态（进程级，离开会话页不中断）
+    val callState by chatViewModel.callState.collectAsStateWithLifecycle()
+    val callElapsedSeconds by chatViewModel.callElapsedSeconds.collectAsStateWithLifecycle()
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     var inputText by remember { mutableStateOf("") }
     val keyboardController = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
     var showRedPacketDialog by remember { mutableStateOf(false) }
+    var showHangUpConfirm by remember { mutableStateOf(false) }
     // 附件抽屉（+ 号展开，内含图片/文件/红包）
     var showAttachmentDrawer by remember { mutableStateOf(false) }
     // 我的表情抽屉
@@ -273,11 +278,18 @@ fun ChatScreen(
             }
         }
     ) { padding ->
+        Column(modifier = Modifier.fillMaxSize().padding(padding)) {
+            // 加密通话状态栏（通话中/握手中/刚结束 时出现）
+            EncryptedCallBar(
+                state = callState,
+                elapsedSeconds = callElapsedSeconds,
+                onHangUp = { showHangUpConfirm = true },
+                onDismiss = { chatViewModel.dismissCallResult() }
+            )
         Box(modifier = Modifier.fillMaxSize()) {
         LazyColumn(
             modifier = Modifier
-                .fillMaxSize()
-                .padding(padding),
+                .fillMaxSize(),
             state = listState,
             contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(2.dp)
@@ -367,6 +379,25 @@ fun ChatScreen(
                 }
             }
         }
+        }
+    }
+
+    // 挂断确认（「再次点击并确认后退出」）
+    if (showHangUpConfirm) {
+        AlertDialog(
+            onDismissRequest = { showHangUpConfirm = false },
+            title = { Text("结束加密通话") },
+            text = { Text("确认结束与 ${friendName} 的加密通话？双方都会收到结束信号。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showHangUpConfirm = false
+                    chatViewModel.hangUpEncryptedCall()
+                }) { Text("结束通话") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showHangUpConfirm = false }) { Text("继续通话") }
+            }
+        )
     }
 
     if (showRedPacketDialog) {
@@ -438,6 +469,42 @@ fun ChatScreen(
                         }
                         Spacer(Modifier.height(4.dp))
                         Text("红包", style = MaterialTheme.typography.labelMedium)
+                    }
+                    // 加密通话（enigmaj 同构：PQC 握手 + AES-256-GCM 帧）
+                    val inCall = callState.let {
+                        (it is EncryptedCallManager.CallState.Connected && it.peer == friendUid) ||
+                            (it is EncryptedCallManager.CallState.Establishing && it.peer == friendUid)
+                    }
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        FilledIconButton(
+                            onClick = {
+                                showAttachmentDrawer = false
+                                if (inCall) {
+                                    // 再次点击 = 退出，但必须先确认
+                                    showHangUpConfirm = true
+                                } else {
+                                    chatViewModel.startEncryptedCall()
+                                }
+                            },
+                            modifier = Modifier.size(56.dp),
+                            colors = if (inCall) {
+                                IconButtonDefaults.filledIconButtonColors(
+                                    containerColor = MaterialTheme.colorScheme.error
+                                )
+                            } else {
+                                IconButtonDefaults.filledIconButtonColors()
+                            }
+                        ) {
+                            Icon(
+                                if (inCall) Icons.Filled.CallEnd else Icons.Filled.Lock,
+                                if (inCall) "结束加密通话" else "加密通话"
+                            )
+                        }
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            if (inCall) "结束通话" else "加密通话",
+                            style = MaterialTheme.typography.labelMedium
+                        )
                     }
                 }
                 Spacer(Modifier.height(16.dp))
@@ -1382,4 +1449,106 @@ private fun BurnMessageBubble(
             }
         }
     }
+}
+
+
+/**
+ * 加密通话状态栏。
+ *
+ * 显示内容对应 enigmaj 的握手/密钥语义：
+ * - 握手中：算法名（ML-KEM-768 或降级 ECDH P-256）
+ * - 通话中：已持续时长 + 共享密钥指纹（双方指纹一致即说明握手成功）
+ * - 已结束：原因文案，3 秒后自动收起
+ */
+@Composable
+private fun EncryptedCallBar(
+    state: EncryptedCallManager.CallState,
+    elapsedSeconds: Long,
+    onHangUp: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    when (state) {
+        is EncryptedCallManager.CallState.Idle -> Unit
+
+        is EncryptedCallManager.CallState.Establishing -> {
+            CallBarSurface(container = MaterialTheme.colorScheme.tertiaryContainer) {
+                Icon(Icons.Filled.Lock, null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(8.dp))
+                Column(Modifier.weight(1f)) {
+                    Text("正在建立加密通话…", style = MaterialTheme.typography.labelLarge)
+                    Text(
+                        "握手算法：${state.kem}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                TextButton(onClick = onHangUp) { Text("取消") }
+            }
+        }
+
+        is EncryptedCallManager.CallState.Connected -> {
+            CallBarSurface(container = MaterialTheme.colorScheme.primaryContainer) {
+                Icon(Icons.Filled.Lock, null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(8.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        "加密通话中 · ${formatCallDuration(elapsedSeconds)}",
+                        style = MaterialTheme.typography.labelLarge
+                    )
+                    Text(
+                        "${state.kem} · 密钥指纹 ${state.fingerprint}" +
+                            if (state.persisted) " · 已持久化" else "",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                TextButton(onClick = onHangUp) { Text("挂断") }
+            }
+        }
+
+        is EncryptedCallManager.CallState.Ended -> {
+            LaunchedEffect(state.at) {
+                delay(3_000)
+                onDismiss()
+            }
+            CallBarSurface(container = MaterialTheme.colorScheme.surfaceVariant) {
+                Icon(Icons.Filled.CallEnd, null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    state.reason,
+                    style = MaterialTheme.typography.labelLarge,
+                    modifier = Modifier.weight(1f)
+                )
+                TextButton(onClick = onDismiss) { Text("知道了") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CallBarSurface(
+    container: androidx.compose.ui.graphics.Color,
+    content: @Composable androidx.compose.foundation.layout.RowScope.() -> Unit
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        color = container,
+        tonalElevation = 2.dp
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            content = content
+        )
+    }
+}
+
+/** 00:12 / 01:02:03 */
+private fun formatCallDuration(seconds: Long): String {
+    val h = seconds / 3600
+    val m = (seconds % 3600) / 60
+    val s = seconds % 60
+    return if (h > 0) "%d:%02d:%02d".format(h, m, s) else "%02d:%02d".format(m, s)
 }

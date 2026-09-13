@@ -5,6 +5,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.google.gson.Gson
 import com.oldchat.material.OldChatApplication
+import com.oldchat.material.core.e2e.E2eFrame
 import com.oldchat.material.core.model.Message
 import com.oldchat.material.core.network.TypingEvent
 import com.oldchat.material.core.model.MessagePayloadBuilder
@@ -915,6 +916,30 @@ class ChatViewModel : ViewModel() {
         }
     }
 
+    // ---- 加密通话（enigmaj 同构的 PQC 握手 + AES-256-GCM 帧） ----
+
+    private val callManager get() = app.encryptedCallManager
+    val callState = app.encryptedCallManager.state
+    val callElapsedSeconds = app.encryptedCallManager.elapsedSeconds
+    val callSystemText = app.encryptedCallManager.systemText
+
+    /** 拨出/挂断都由界面调用；第二次点击 = 挂断（界面负责先弹确认） */
+    fun startEncryptedCall() {
+        if (friendUid.isBlank()) return
+        callManager.start(friendUid)
+    }
+
+    fun hangUpEncryptedCall() {
+        callManager.hangUp()
+    }
+
+    fun dismissCallResult() {
+        callManager.acknowledgeEnded()
+    }
+
+    /** 当前会话是否正在加密通话中 */
+    fun isInEncryptedCall(): Boolean = callManager.isInCallWith(friendUid)
+
     // ---- Receive WS Messages ----
 
     fun onWsMessage(message: Message) {
@@ -927,6 +952,18 @@ class ChatViewModel : ViewModel() {
             message.threadId == threadId ||
             message.fromUid == myUid // 自己发送的回显
         if (!belongsCurrent) return
+
+        // 加密通话的控制帧（PQC_BEGIN / PQC_REPLY / ENC）交给通话层消费：
+        // 它们不该出现在聊天气泡里，也不该写进消息缓存。
+        // 收到 PQC_BEGIN 时通话层会自动回 PQC_REPLY（与 enigmaj 的响应方行为一致）。
+        // 注意：自己发出的帧会被服务端回显（fromUid == 自己），必须排除，
+        // 否则会把自己的 PQC_BEGIN 当成对方的呼叫、回自己一个 PQC_REPLY。
+        if (myUid != null && message.fromUid != myUid &&
+            E2eFrame.isE2e(message.body) &&
+            callManager.handleIncoming(message.body, message.fromUid)
+        ) {
+            return
+        }
 
         // ALIGN-02：收到本会话实时消息 → 合并触发一次回执刷新（替代 5s 轮询）
         triggerReceiptRefresh()
