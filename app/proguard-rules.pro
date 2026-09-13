@@ -52,3 +52,9 @@
 -assumenosideeffects class kotlin.jvm.internal.Intrinsics {
     static void checkNotNullParameter(...);
 }
+
+# ---- slf4j 静态绑定探测（CI: :app:minifyReleaseWithR8 实测缺类） ----
+# R8 会因 org.slf4j.LoggerFactory 里对 StaticLoggerBinder 的可选探测而报 Missing class。
+# 这类引用在运行期是「找不到就走 NOP logger」的可选路径，声明 dontwarn 即可。
+-dontwarn org.slf4j.**
+-dontwarn org.slf4j.impl.**
