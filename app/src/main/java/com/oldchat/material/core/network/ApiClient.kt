@@ -315,7 +315,8 @@ class ApiClient(
                             "username" to username,
                             "password" to password,
                             "platform" to "android",
-                            "app_version" to "1.0.0"
+                            // BUG-20：版本号单一来源（原来这里、设置页、gradle 三处各写各的）
+                            "app_version" to com.oldchat.material.BuildConfig.VERSION_NAME
                         )
                     )
                 )
