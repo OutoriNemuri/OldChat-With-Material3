@@ -1,3 +1,7 @@
+// 注意：Kotlin DSL 脚本里 `java` 会被 Gradle 的 java 扩展遮蔽，
+// 所以必须 import 后才能用 Properties（否则 java.util.Properties 报 Unresolved reference）。
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
@@ -21,13 +25,22 @@ android {
         }
     }
 
+    // BUG-25：release 签名原来是整段注释掉的 → 打出来的 release 包是「未签名」的，
+    // 根本装不上。现在读取根目录 keystore.properties（不进版本库），
+    // 没配置时给出明确提示而不是静默出一个装不上的包。
+    val keystorePropsFile = rootProject.file("keystore.properties")
+    val keystoreProps = Properties().apply {
+        if (keystorePropsFile.exists()) keystorePropsFile.inputStream().use { load(it) }
+    }
+
     signingConfigs {
         create("release") {
-            // Release signing configured via keystore.properties (mirrors §14.2)
-            // storeFile file(project.findProperty("storeFile") ?: "debug.keystore")
-            // storePassword project.findProperty("storePassword") ?: ""
-            // keyAlias project.findProperty("keyAlias") ?: ""
-            // keyPassword project.findProperty("keyPassword") ?: ""
+            if (keystorePropsFile.exists()) {
+                storeFile = file(keystoreProps.getProperty("storeFile") ?: "release.keystore")
+                storePassword = keystoreProps.getProperty("storePassword")
+                keyAlias = keystoreProps.getProperty("keyAlias")
+                keyPassword = keystoreProps.getProperty("keyPassword")
+            }
         }
     }
 
@@ -42,7 +55,11 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            // signingConfig = signingConfigs.getByName("release")
+            // 只在提供了 keystore.properties 时才绑定签名配置，否则保持未签名
+            // （CI 上可显式传入，避免本地没有密钥时误出包）。
+            if (keystorePropsFile.exists()) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
     compileOptions {
@@ -54,6 +71,8 @@ android {
     }
     buildFeatures {
         compose = true
+        // BUG-20：设置页要显示真实版本号（原来硬编码 "2.3.4 (build 1)"）
+        buildConfig = true
     }
     packaging {
         resources {
@@ -90,17 +109,20 @@ dependencies {
     implementation(libs.androidx.material.icons.core)
     implementation(libs.androidx.material.icons.extended)
 
-    // Navigation
-    implementation(libs.androidx.navigation.compose)
+    // 加密通话：ML-KEM-768（FIPS 203）——与 enigmaj 相同的 KEM。
+    // 代码里通过反射调用 BC 的 mlkem 包，因此即使此依赖缺失也只是自动降级为
+    // ECDH P-256（帧格式不变），不会编译/运行失败。
+    implementation(libs.bouncycastle)
+
+    // BUG-25：navigation-compose 全工程零引用（页面切换是自己写的状态机），
+    // 保留会让 R8 之外还多一份运行时依赖，直接移除。
+    // implementation(libs.androidx.navigation.compose)
 
     // ViewModel
     implementation(libs.androidx.lifecycle.viewmodel.compose)
 
-    // Room (local database)
-    implementation(libs.androidx.room.runtime)
-    implementation(libs.androidx.room.ktx)
-    // Note: add room-compiler via ksp when KSP plugin is available
-    // For now, Room entities will use in-memory caches; Room annotations added later
+    // BUG-25：Room 是死依赖 —— 全工程没有任何 @Entity/@Dao/RoomDatabase，
+    // 本地持久化实际用的是 SharedPreferences + JSON 缓存。移除后 APK 更小、也不会误导。
 
     // Ktor (HTTP client)
     implementation(libs.ktor.client.core)

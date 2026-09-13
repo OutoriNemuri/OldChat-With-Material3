@@ -30,11 +30,18 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import com.oldchat.material.core.notify.AppForeground
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
+import com.oldchat.material.core.e2e.EncryptedCallManager
 import com.oldchat.material.core.model.Message
 import com.oldchat.material.core.model.MessagePayloadBuilder
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.distinctUntilChanged
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 
@@ -54,6 +61,45 @@ fun ChatScreen(
 ) {
     val messages by chatViewModel.messages.collectAsStateWithLifecycle()
     val myAvatarUrl by chatViewModel.myAvatarUrl.collectAsStateWithLifecycle()
+    val isPeerTyping by chatViewModel.isPeerTyping.collectAsStateWithLifecycle()
+    // 加密通话状态（进程级，离开会话页不中断）
+    val callState by chatViewModel.callState.collectAsStateWithLifecycle()
+    val callElapsedSeconds by chatViewModel.callElapsedSeconds.collectAsStateWithLifecycle()
+    val callQueueHint by chatViewModel.callQueueHint.collectAsStateWithLifecycle()
+
+    // 通话进行中（含握手中）自动进入全屏通话页；点「返回聊天」可收起为顶部状态栏
+    val callActive = callState.let {
+        (it is EncryptedCallManager.CallState.Connected && it.peer == friendUid) ||
+            (it is EncryptedCallManager.CallState.Establishing && it.peer == friendUid)
+    }
+    var callOverlayVisible by remember { mutableStateOf(false) }
+    // 挂断确认框状态：必须在下面的通话页分支之前声明（Kotlin 局部变量按声明顺序可见）
+    var showHangUpConfirm by remember { mutableStateOf(false) }
+    LaunchedEffect(callActive) {
+        // 通话开始 → 自动展开；通话结束 → 收起
+        callOverlayVisible = callActive
+    }
+    if (callOverlayVisible && callActive) {
+        EncryptedCallScreen(
+            peerName = friendName,
+            state = callState,
+            elapsedSeconds = callElapsedSeconds,
+            onHangUp = { showHangUpConfirm = true },
+            onMinimize = { callOverlayVisible = false }
+        )
+        // 挂断确认框仍要能弹出来
+        if (showHangUpConfirm) {
+            HangUpConfirmDialog(
+                peerName = friendName,
+                onConfirm = {
+                    showHangUpConfirm = false
+                    chatViewModel.hangUpEncryptedCall()
+                },
+                onDismiss = { showHangUpConfirm = false }
+            )
+        }
+        return
+    }
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
@@ -123,10 +169,27 @@ fun ChatScreen(
             scrollInitDone = true
         }
     }
-    // 后续新增消息（发送/接收）时滚到底部
+    // BUG-05：新增消息时不再「无条件」把视图拽到底部——
+    // 原来只要有人发消息，正在翻历史的用户就会被强制弹回底部。
+    // 现在的规则：用户本来就在底部附近、或这条消息是自己发的，才自动滚到底；
+    // 否则只累计「新消息」计数，显示浮标由用户决定何时跳。
+    var pendingNewMessages by remember { mutableStateOf(0) }
+    val isNearBottom by remember {
+        derivedStateOf {
+            val info = listState.layoutInfo
+            val last = info.visibleItemsInfo.lastOrNull()
+            last == null || last.index >= info.totalItemsCount - 2
+        }
+    }
+
     LaunchedEffect(messages.size) {
-        if (scrollInitDone && messages.isNotEmpty()) {
+        if (!scrollInitDone || messages.isEmpty()) return@LaunchedEffect
+        val newestIsMine = messages.lastOrNull()?.let { chatViewModel.isOwnMessage(it) } == true
+        if (isNearBottom || newestIsMine) {
             listState.scrollToItem(messages.size)
+            pendingNewMessages = 0
+        } else {
+            pendingNewMessages += 1
         }
     }
 
@@ -136,7 +199,16 @@ fun ChatScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text(friendName, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                title = {
+                    // ALIGN-15：对方输入中时把标题换成提示
+                    if (isPeerTyping) {
+                        Text("正在输入…", maxLines = 1,
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.primary)
+                    } else {
+                        Text(friendName, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.Filled.ArrowBack, "返回")
@@ -213,7 +285,11 @@ fun ChatScreen(
                         }
                         OutlinedTextField(
                             value = inputText,
-                            onValueChange = { inputText = it },
+                            onValueChange = {
+                                inputText = it
+                                // ALIGN-15：把「正在输入」同步给对方（内部有节流）
+                                chatViewModel.onInputChanged(it)
+                            },
                             modifier = Modifier.weight(1f),
                             placeholder = { Text("输入消息…") },
                             maxLines = 4,
@@ -236,10 +312,20 @@ fun ChatScreen(
             }
         }
     ) { padding ->
+        Column(modifier = Modifier.fillMaxSize().padding(padding)) {
+            // 加密通话状态栏（通话中/握手中/刚结束 时出现）
+            EncryptedCallBar(
+                state = callState,
+                elapsedSeconds = callElapsedSeconds,
+                queueHint = callQueueHint,
+                onHangUp = { showHangUpConfirm = true },
+                onDismiss = { chatViewModel.dismissCallResult() },
+                onExpand = { callOverlayVisible = true }
+            )
+        Box(modifier = Modifier.fillMaxSize()) {
         LazyColumn(
             modifier = Modifier
-                .fillMaxSize()
-                .padding(padding),
+                .fillMaxSize(),
             state = listState,
             contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(2.dp)
@@ -275,6 +361,7 @@ fun ChatScreen(
                         if (text.isNotEmpty()) clipboard.setText(AnnotatedString(text))
                     },
                     onQuote = { quoteDraft = message },
+                    onBurnOpen = { chatViewModel.openBurnMessage(it) },
                     modifier = Modifier.animateItem()
                 )
             }
@@ -294,6 +381,53 @@ fun ChatScreen(
                 }
             }
         }
+
+            // BUG-05：不在底部时，新消息只用浮标提示（用户自己决定何时跳回去）
+            if (pendingNewMessages > 0) {
+                Surface(
+                    onClick = {
+                        scope.launch {
+                            listState.scrollToItem(messages.size)
+                            pendingNewMessages = 0
+                        }
+                    },
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(end = 16.dp, bottom = 16.dp),
+                    shape = RoundedCornerShape(20.dp),
+                    color = MaterialTheme.colorScheme.primary,
+                    shadowElevation = 4.dp
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Filled.KeyboardArrowDown, "回到最新",
+                            tint = MaterialTheme.colorScheme.onPrimary,
+                            modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            "$pendingNewMessages 条新消息",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onPrimary
+                        )
+                    }
+                }
+            }
+        }
+        }
+    }
+
+    // 挂断确认（「再次点击并确认后退出」）
+    if (showHangUpConfirm) {
+        HangUpConfirmDialog(
+            peerName = friendName,
+            onConfirm = {
+                showHangUpConfirm = false
+                chatViewModel.hangUpEncryptedCall()
+            },
+            onDismiss = { showHangUpConfirm = false }
+        )
     }
 
     if (showRedPacketDialog) {
@@ -366,6 +500,42 @@ fun ChatScreen(
                         Spacer(Modifier.height(4.dp))
                         Text("红包", style = MaterialTheme.typography.labelMedium)
                     }
+                    // 加密通话（enigmaj 同构：PQC 握手 + AES-256-GCM 帧）
+                    val inCall = callState.let {
+                        (it is EncryptedCallManager.CallState.Connected && it.peer == friendUid) ||
+                            (it is EncryptedCallManager.CallState.Establishing && it.peer == friendUid)
+                    }
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        FilledIconButton(
+                            onClick = {
+                                showAttachmentDrawer = false
+                                if (inCall) {
+                                    // 再次点击 = 退出，但必须先确认
+                                    showHangUpConfirm = true
+                                } else {
+                                    chatViewModel.startEncryptedCall()
+                                }
+                            },
+                            modifier = Modifier.size(56.dp),
+                            colors = if (inCall) {
+                                IconButtonDefaults.filledIconButtonColors(
+                                    containerColor = MaterialTheme.colorScheme.error
+                                )
+                            } else {
+                                IconButtonDefaults.filledIconButtonColors()
+                            }
+                        ) {
+                            Icon(
+                                if (inCall) Icons.Filled.CallEnd else Icons.Filled.Lock,
+                                if (inCall) "结束加密通话" else "加密通话"
+                            )
+                        }
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            if (inCall) "结束通话" else "加密通话",
+                            style = MaterialTheme.typography.labelMedium
+                        )
+                    }
                 }
                 Spacer(Modifier.height(16.dp))
             }
@@ -387,6 +557,39 @@ fun ChatScreen(
         }
     }
 
+    // BUG-09：记录「当前正在看的会话」，避免给正在看的会话再弹通知
+    DisposableEffect(friendUid) {
+        AppForeground.activeChatId = friendUid
+        onDispose {
+            if (AppForeground.activeChatId == friendUid) AppForeground.activeChatId = null
+        }
+    }
+
+    // ALIGN-02：回到前台补一次回执刷新（配合事件驱动，不再 5 秒轮询）
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> chatViewModel.onScreenResumed()
+                // ALIGN-14：后台停掉前台专用的刷新型工作
+                Lifecycle.Event.ON_PAUSE -> chatViewModel.onScreenPaused()
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    // ALIGN-13：向上滚到顶时按需拉取更早一页（进入会话只拉最新页）
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.firstVisibleItemIndex }
+            .distinctUntilChanged()
+            .collect { firstVisible ->
+                // 内部已有 isLoadingMore / historyHasMore 守卫，这里只做触发
+                if (firstVisible <= 2) chatViewModel.loadMoreHistory()
+            }
+    }
+
     DisposableEffect(Unit) {
         onDispose { chatViewModel.destroy() }
     }
@@ -406,6 +609,8 @@ private fun MessageBubble(
     onClaimRedPacket: (String) -> Unit = {},
     onCopy: () -> Unit = {},
     onQuote: () -> Unit = {},
+    // ALIGN-17：阅后即焚「已查看」上报
+    onBurnOpen: (Message) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val bubbleColor = if (isOwn)
@@ -426,6 +631,20 @@ private fun MessageBubble(
 
     // 长按菜单状态
     var menuExpanded by remember { mutableStateOf(false) }
+
+    // BUG-21 / ALIGN-17：阅后即焚。
+    // 原实现只把 burn_after_seconds 解析进模型，UI 完全无视 → 「阅后即焚」形同虚设。
+    // 现在：点击查看一次 → 倒计时 burnAfterSeconds → 到期销毁正文（本地不再展示）。
+    // 注意：服务端销毁回执端点未在官方文档中给出，这里只做本地销毁，不伪造服务端行为。
+    if (message.burnAfterSeconds > 0) {
+        BurnMessageBubble(
+            message = message,
+            isOwn = isOwn,
+            modifier = modifier,
+            onOpen = { onBurnOpen(message) }
+        )
+        return
+    }
 
     Box {
         Row(
@@ -481,6 +700,16 @@ private fun MessageBubble(
                                 verticalAlignment = Alignment.CenterVertically,
                                 modifier = Modifier.padding(top = 2.dp)
                             ) {
+                                // 加密通话内的消息：加一把小锁（本地标记，非服务端字段）
+                                if (message.encrypted) {
+                                    Icon(
+                                        Icons.Filled.Lock,
+                                        contentDescription = "端到端加密发送",
+                                        modifier = Modifier.size(10.dp),
+                                        tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.8f)
+                                    )
+                                    Spacer(Modifier.width(3.dp))
+                                }
                                 Text(
                                     formatMessageTime(message.createdAt),
                                     style = MaterialTheme.typography.labelSmall,
@@ -1190,4 +1419,351 @@ private fun formatFileSize(bytes: Long): String {
         bytes < 1024 * 1024 * 1024 -> "%.1f MB".format(bytes / (1024.0 * 1024))
         else -> "%.1f GB".format(bytes / (1024.0 * 1024 * 1024))
     }
+}
+
+
+/**
+ * ALIGN-17 / BUG-21：阅后即焚气泡。
+ *
+ * 状态机：locked（未读）→ counting（已展开，倒计时中）→ burned（已销毁）。
+ * 销毁只作用于本地展示与内存列表，不伪装「服务端已删除」——
+ * 官方文档未定义销毁回执端点，客户端不应该假装做过。
+ */
+@Composable
+private fun BurnMessageBubble(
+    message: Message,
+    isOwn: Boolean,
+    modifier: Modifier = Modifier,
+    onOpen: () -> Unit = {}
+) {
+    var revealed by remember(message.id) { mutableStateOf(false) }
+    var remaining by remember(message.id) { mutableStateOf(message.burnAfterSeconds) }
+    var burned by remember(message.id) { mutableStateOf(false) }
+
+    LaunchedEffect(revealed, remaining) {
+        if (!revealed || remaining <= 0) return@LaunchedEffect
+        delay(1000L)
+        remaining -= 1
+        if (remaining <= 0) burned = true
+    }
+
+    val content = MessagePayloadBuilder.extractPreviewText(message.msgType, message.body)
+
+    Row(
+        modifier = modifier.fillMaxWidth().padding(vertical = 2.dp),
+        horizontalArrangement = if (isOwn) Arrangement.End else Arrangement.Start
+    ) {
+        Surface(
+            shape = RoundedCornerShape(16.dp),
+            color = MaterialTheme.colorScheme.surfaceVariant,
+            modifier = Modifier.clickable(enabled = !revealed && !burned) {
+                revealed = true
+                // ALIGN-17：查看即上报（只对对方发来的消息上报，自己发的不需要）
+                if (!isOwn) onOpen()
+            }
+        ) {
+            Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Filled.LocalFireDepartment, null,
+                        modifier = Modifier.size(14.dp),
+                        tint = MaterialTheme.colorScheme.error)
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        when {
+                            burned -> "已焚毁"
+                            revealed -> "阅后即焚 · ${remaining}s"
+                            else -> "阅后即焚消息"
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
+                if (revealed && !burned) {
+                    Spacer(Modifier.height(6.dp))
+                    Text(content.ifBlank { "[非文本消息]" }, style = MaterialTheme.typography.bodyMedium)
+                } else if (!revealed) {
+                    Spacer(Modifier.height(6.dp))
+                    Text("点击查看", style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        }
+    }
+}
+
+
+/**
+ * 加密通话状态栏。
+ *
+ * 显示内容对应 enigmaj 的握手/密钥语义：
+ * - 握手中：算法名（ML-KEM-768 或降级 ECDH P-256）
+ * - 通话中：已持续时长 + 共享密钥指纹（双方指纹一致即说明握手成功）
+ * - 已结束：原因文案，3 秒后自动收起
+ */
+@Composable
+private fun EncryptedCallBar(
+    state: EncryptedCallManager.CallState,
+    elapsedSeconds: Long,
+    queueHint: String? = null,
+    onHangUp: () -> Unit,
+    onDismiss: () -> Unit,
+    onExpand: () -> Unit = {}
+) {
+    when (state) {
+        is EncryptedCallManager.CallState.Idle -> Unit
+
+        is EncryptedCallManager.CallState.Establishing -> {
+            CallBarSurface(container = MaterialTheme.colorScheme.tertiaryContainer) {
+                Icon(Icons.Filled.Lock, null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(8.dp))
+                Column(Modifier.weight(1f)) {
+                    Text("正在建立加密通话…", style = MaterialTheme.typography.labelLarge)
+                    Text(
+                        queueHint ?: "握手算法：${state.kem}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                TextButton(onClick = onHangUp) { Text("取消") }
+            }
+        }
+
+        is EncryptedCallManager.CallState.Connected -> {
+            CallBarSurface(container = MaterialTheme.colorScheme.primaryContainer) {
+                Icon(Icons.Filled.Lock, null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(8.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        "加密通话中 · ${formatCallDuration(elapsedSeconds)}",
+                        style = MaterialTheme.typography.labelLarge
+                    )
+                    Text(
+                        "${state.kem} · 密钥指纹 ${state.fingerprint}" +
+                            if (state.persisted) " · 已持久化" else "",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                TextButton(onClick = onExpand) { Text("通话页面") }
+                TextButton(onClick = onHangUp) { Text("挂断") }
+            }
+        }
+
+        is EncryptedCallManager.CallState.Ended -> {
+            LaunchedEffect(state.at) {
+                delay(3_000)
+                onDismiss()
+            }
+            CallBarSurface(container = MaterialTheme.colorScheme.surfaceVariant) {
+                Icon(Icons.Filled.CallEnd, null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    state.reason,
+                    style = MaterialTheme.typography.labelLarge,
+                    modifier = Modifier.weight(1f)
+                )
+                TextButton(onClick = onDismiss) { Text("知道了") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CallBarSurface(
+    container: androidx.compose.ui.graphics.Color,
+    content: @Composable androidx.compose.foundation.layout.RowScope.() -> Unit
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        color = container,
+        tonalElevation = 2.dp
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            content = content
+        )
+    }
+}
+
+/** 00:12 / 01:02:03 */
+private fun formatCallDuration(seconds: Long): String {
+    val h = seconds / 3600
+    val m = (seconds % 3600) / 60
+    val s = seconds % 60
+    return if (h > 0) "%d:%02d:%02d".format(h, m, s) else "%02d:%02d".format(m, s)
+}
+
+/**
+ * 全屏加密通话页。
+ *
+ * 只展示「加密会话本身」的可验证信息：算法、密钥指纹（双方一致即握手成功）、通话时长。
+ * 本版不含音频管线，所以页面上不出现「麦克风/扬声器」这类会误导的控件。
+ */
+@Composable
+private fun EncryptedCallScreen(
+    peerName: String,
+    state: EncryptedCallManager.CallState,
+    elapsedSeconds: Long,
+    onHangUp: () -> Unit,
+    onMinimize: () -> Unit
+) {
+    val connected = state as? EncryptedCallManager.CallState.Connected
+    val establishing = state as? EncryptedCallManager.CallState.Establishing
+
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = MaterialTheme.colorScheme.surface
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .navigationBarsPadding()
+                .statusBarsPadding()
+                .padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Spacer(Modifier.height(32.dp))
+
+            Surface(
+                shape = androidx.compose.foundation.shape.CircleShape,
+                color = MaterialTheme.colorScheme.primaryContainer,
+                modifier = Modifier.size(96.dp)
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        Icons.Filled.Lock,
+                        contentDescription = null,
+                        modifier = Modifier.size(44.dp),
+                        tint = MaterialTheme.colorScheme.onPrimaryContainer
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(20.dp))
+            Text(peerName.ifBlank { "对方" }, style = MaterialTheme.typography.headlineSmall)
+            Spacer(Modifier.height(8.dp))
+
+            Text(
+                when {
+                    connected != null -> "加密通话中"
+                    establishing != null -> "正在建立加密通话…"
+                    else -> "通话已结束"
+                },
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.primary
+            )
+
+            Spacer(Modifier.height(6.dp))
+            Text(
+                connected?.let { formatCallDuration(elapsedSeconds) }
+                    ?: (establishing?.kem ?: ""),
+                style = MaterialTheme.typography.displaySmall
+            )
+
+            Spacer(Modifier.height(24.dp))
+
+            // 握手可验证信息
+            Surface(
+                shape = RoundedCornerShape(12.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(Modifier.padding(16.dp)) {
+                    CallInfoRow("密钥封装算法", connected?.kem ?: establishing?.kem ?: "-")
+                    CallInfoRow(
+                        "共享密钥指纹",
+                        connected?.fingerprint ?: "握手中…"
+                    )
+                    CallInfoRow(
+                        "密钥来源",
+                        when {
+                            connected == null -> "-"
+                            connected.persisted -> "本地共享密钥（可跨通话复用）"
+                            else -> "本次握手生成"
+                        }
+                    )
+                    CallInfoRow("角色", if (connected != null) {
+                        if (connected.role == EncryptedCallManager.Role.INITIATOR) "发起方" else "响应方"
+                    } else "-")
+                }
+            }
+
+            Spacer(Modifier.weight(1f))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    FilledTonalIconButton(onClick = onMinimize, modifier = Modifier.size(56.dp)) {
+                        Icon(Icons.Filled.KeyboardArrowDown, "返回聊天")
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    Text("返回聊天", style = MaterialTheme.typography.labelMedium)
+                }
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    FilledIconButton(
+                        onClick = onHangUp,
+                        modifier = Modifier.size(72.dp),
+                        colors = IconButtonDefaults.filledIconButtonColors(
+                            containerColor = MaterialTheme.colorScheme.error
+                        )
+                    ) {
+                        Icon(Icons.Filled.CallEnd, "结束通话", modifier = Modifier.size(30.dp))
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    Text("结束通话", style = MaterialTheme.typography.labelMedium)
+                }
+            }
+
+            Spacer(Modifier.height(24.dp))
+        }
+    }
+}
+
+@Composable
+private fun CallInfoRow(label: String, value: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            label,
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.width(96.dp)
+        )
+        Text(
+            value,
+            style = MaterialTheme.typography.bodyMedium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
+/** 挂断前的确认框（单聊抽屉按钮与通话页共用）。 */
+@Composable
+private fun HangUpConfirmDialog(
+    peerName: String,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("结束加密通话") },
+        text = { Text("确认结束与 ${peerName.ifBlank { "对方" }} 的加密通话？双方都会收到结束信号。") },
+        confirmButton = {
+            TextButton(onClick = onConfirm) { Text("结束通话") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("继续通话") }
+        }
+    )
 }

@@ -12,7 +12,9 @@
 
 - 🎨 **Material You** —— 基于 Material Design 3 的动态取色与自适应外观
 - 💬 **即时消息** —— 私聊、群聊、阅后即焚、红包等完整消息能力
-- 🔒 **端到端加密** —— WebSocket 实时消息的 ECDH + AES-CBC + HMAC 加密会话协议
+- 🔒 **传输层加密** —— 与服务器之间的 ECDH(secp256r1) + AES-256-CBC + HMAC-SHA256 会话协议
+  （注意：这是**传输层**加密，不是端到端加密；消息在服务端是可见的。客户端侧的
+  E2E 消息层（ML-KEM + AES-GCM）尚未实现。）
 - 📡 **双通道消息接收** —— WebSocket 实时推送 + HTTP 轮询兜底（5s 间隔）
 - 🕐 **打卡墙** —— 每日签到、Like/评论互动
 - 🎵 **音乐广场** —— 音乐上传、播放、下载、点赞
@@ -29,7 +31,7 @@
 | UI | Jetpack Compose + Material 3 |
 | 网络 | Ktor Client + OkHttp（WebSocket） |
 | 序列化 | Gson + kotlinx.serialization |
-| 加密 | ECDH (secp256r1) + AES-256-CBC + HMAC-SHA256 |
+| 加密 | 传输层：ECDH (secp256r1) + AES-256-CBC + HMAC-SHA256（非端到端）|
 | 本地存储 | DataStore Preferences |
 | 图片加载 | Coil |
 | 音视频 | Media3 (ExoPlayer) |

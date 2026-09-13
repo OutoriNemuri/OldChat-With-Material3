@@ -1,15 +1,20 @@
+@file:OptIn(kotlinx.coroutines.FlowPreview::class)
 package com.oldchat.material.feature.chat
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.google.gson.Gson
 import com.oldchat.material.OldChatApplication
+import com.oldchat.material.core.e2e.E2eFrame
+import com.oldchat.material.core.e2e.EncryptedCallManager
 import com.oldchat.material.core.model.Message
+import com.oldchat.material.core.network.TypingEvent
 import com.oldchat.material.core.model.MessagePayloadBuilder
 import com.oldchat.material.core.media.MediaUploader
 import android.content.Context
 import android.net.Uri
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.*
 import java.util.concurrent.atomic.AtomicLong
 
@@ -37,8 +42,22 @@ class ChatViewModel : ViewModel() {
     private var friendName: String = ""
     private var threadId: String = ""
     private var wsSubscription: Job? = null
-    // 周期刷新（拉取已读/送达回执）
+    // 事件驱动的回执刷新（ALIGN-02：不再是 5s 轮询）
     private var receiptRefreshJob: Job? = null
+
+    // ALIGN-11：已读上报防抖
+    private var markReadJob: Job? = null
+    private var lastReadRequestAt: Long = 0L
+
+    // ALIGN-13：历史分页状态（注意：本类已有同名 isLoadingMore 用于旧分页逻辑，
+    // 故这里必须用不同名字，否则 Conflicting declarations）
+    private var isLoadingMoreHistory = false
+    private var historyHasMore = true
+    private var loadedPages = 1
+    private val receiptRefreshTrigger = MutableSharedFlow<Unit>(
+        extraBufferCapacity = 8,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
 
     // 自己的头像（用于右侧头像，Bug: 单/群聊不显示自己头像）
     private val _myAvatarUrl = MutableStateFlow<String?>(null)
@@ -70,7 +89,12 @@ class ChatViewModel : ViewModel() {
     private val localIdCounter = AtomicLong(System.currentTimeMillis())
 
     fun init(uid: String, name: String) {
-        if (friendUid == uid) return
+        // BUG-06：原实现是 `if (friendUid == uid) return`。
+        // 而 ChatScreen 在离开时就会调 destroy()（取消 WS 订阅与回执刷新），
+        // 导致「退出会话 → 再进来同一个会话」时 init 直接早退：
+        //   ① 不再订阅 WS，实时消息全丢；② 不再刷新回执；③ 不再重新拉历史。
+        // 现在只有「同一个会话且订阅仍然活着」才早退，否则走完整初始化。
+        if (friendUid == uid && wsSubscription?.isActive == true) return
         friendUid = uid
         friendName = name
         threadId = uid
@@ -91,7 +115,14 @@ class ChatViewModel : ViewModel() {
         // Load from cache first
         val cached = cache.loadDirectMessages(uid)
         if (cached.isNotEmpty()) {
-            _messages.value = cached.filter { it.threadId == uid || it.fromUid == uid }
+            // BUG-07：thread_id 是不透明会话 id，既不是 uid 也不是对方 uid。
+            // 原过滤器 `threadId == uid || fromUid == uid` 会把「自己发的消息」全部滤掉
+            // （自己发的 from_uid = 我，thread_id = 会话 id），表现为重进会话后只看到对方说的话。
+            val myUid = app.authManager.myUid ?: ""
+            _messages.value = cached.filter { m ->
+                m.threadId == uid || m.fromUid == uid || m.peerUid == uid ||
+                    (myUid.isNotEmpty() && m.fromUid == myUid)
+            }
             messageIds.addAll(_messages.value.map { it.id })
         }
 
@@ -109,27 +140,139 @@ class ChatViewModel : ViewModel() {
 
         loadMyAvatar()
 
-        // 启动周期回执刷新：定时拉取 /direct/messages/v2 最新一页，
-        // 更新自己已发送消息的 delivered_at/read_at，实现「已读对号」实时刷新。
+        // 加密通话状态变化 → 处理「握手中暂存」的消息
+        viewModelScope.launch {
+            callManager.state.collect { st ->
+                when {
+                    st is EncryptedCallManager.CallState.Connected && st.peer == friendUid ->
+                        flushCallQueue()          // 密钥就绪：按加密发送
+                    st is EncryptedCallManager.CallState.Ended && queuedWhileCalling.isNotEmpty() ->
+                        flushCallQueue()          // 通话没成：不丢消息，按明文补发
+                }
+            }
+        }
+
+        // ALIGN-15：订阅 typing 事件
+        viewModelScope.launch {
+            app.wsManager.typingEvents.collect { handleTyping(it) }
+        }
+
+        // ALIGN-02：改为事件驱动的回执刷新（见 startReceiptRefresh）。
         startReceiptRefresh()
     }
 
     /**
-     * 周期刷新已读/送达回执。每 RECEIPT_REFRESH_INTERVAL_MS 拉取最新一页消息，
-     * 仅更新已有消息的回执字段（不整页替换、不打扰当前浏览位置）。
+     * ALIGN-02：已读/送达回执刷新。
+     *
+     * 原实现是 `while (isActive) { refresh(); delay(5s) }` —— 会话页打开期间
+     * 每 5 秒无条件打一次 `/direct/messages/v2?limit=50`，且不受「仅 HTTP 优先」模式门控。
+     * 直接违反 client-guide §0「不得朴素全量刷新」的反滥用红线（会被监测/限流）。
+     *
+     * 现在只在真正可能产生新回执的事件上触发，并做 1.5s 合并：
+     *   ① WS 重连成功（断线期间可能漏了回执）
+     *   ② 本会话收到实时消息（对方此时很可能已读）
+     *   ③ 屏幕回到前台（onScreenResumed）
      */
     private fun startReceiptRefresh() {
         if (receiptRefreshJob?.isActive == true) return
         receiptRefreshJob = viewModelScope.launch {
-            while (isActive) {
-                try {
-                    refreshReceiptsOnce()
-                } catch (_: Exception) {
-                    // 静默失败，下一轮继续
-                }
-                delay(RECEIPT_REFRESH_INTERVAL_MS)
+            launch {
+                app.wsManager.connectionState
+                    .map { it == com.oldchat.material.core.network.WebSocketManager.ConnectionState.CONNECTED }
+                    .distinctUntilChanged()
+                    .filter { it }
+                    .collect { triggerReceiptRefresh() }
+            }
+            launch {
+                receiptRefreshTrigger
+                    .debounce(RECEIPT_REFRESH_DEBOUNCE_MS)
+                    .collect {
+                        try {
+                            refreshReceiptsOnce()
+                        } catch (_: Exception) {
+                            // 静默失败，等下一个事件
+                        }
+                    }
             }
         }
+    }
+
+    /** 请求一次回执刷新（会与其它请求合并，不会产生请求风暴）。 */
+    fun triggerReceiptRefresh() {
+        receiptRefreshTrigger.tryEmit(Unit)
+    }
+
+    // ---- ALIGN-15：输入中（typing） ----
+    private val _isPeerTyping = MutableStateFlow(false)
+    val isPeerTyping: StateFlow<Boolean> = _isPeerTyping.asStateFlow()
+    private var lastTypingSentAt = 0L
+    private var typingResetJob: Job? = null
+
+    /**
+     * ALIGN-15：原来 sendTyping() 定义了却「从来没有被调用过」，
+     * 所以对方永远看不到「正在输入」。这里在输入变化时按 2.5s 节流上报。
+     */
+    fun onInputChanged(text: String) {
+        val now = System.currentTimeMillis()
+        if (text.isNotBlank() && now - lastTypingSentAt > TYPING_THROTTLE_MS) {
+            lastTypingSentAt = now
+            app.wsManager.sendTyping("direct", peerUid = friendUid)
+        }
+    }
+
+    private fun handleTyping(event: TypingEvent) {
+        if (event.chatId != friendUid) return
+        val myUid = app.authManager.myUid ?: ""
+        if (event.uid == myUid) return
+        if (event.isTyping) {
+            _isPeerTyping.value = true
+            // 对方没继续输入就自动收起（服务端不保证发 false）
+            typingResetJob?.cancel()
+            typingResetJob = viewModelScope.launch {
+                delay(TYPING_TIMEOUT_MS)
+                _isPeerTyping.value = false
+            }
+        } else {
+            typingResetJob?.cancel()
+            _isPeerTyping.value = false
+        }
+    }
+
+    /**
+     * ALIGN-17：阅后即焚「打开」回执。
+     * §9 规定收到阅后即焚消息后，用户查看时需上报 /direct/burn/open，
+     * 服务端据此在双方都读过之后删除消息。原实现只解析字段、既不展示也不上报。
+     */
+    fun openBurnMessage(message: Message) {
+        if (message.id.isEmpty() || message.isLocalPending) return
+        viewModelScope.launch {
+            try {
+                apiClient.post(
+                    "/direct/burn/open",
+                    gson.toJson(mapOf("message_id" to message.id))
+                )
+            } catch (_: Exception) {
+                // 上报失败不影响本地「看一次」的语义
+            }
+        }
+    }
+
+    /** 会话页回到前台时调用（对齐 §15：onPause 停监听 / onResume 补一次）。 */
+    fun onScreenResumed() {
+        // ALIGN-14 / ALIGN-13：回前台时补一次增量（不整页重拉），并允许继续分页
+        historyHasMore = true
+        triggerReceiptRefresh()
+    }
+
+    /**
+     * ALIGN-14：会话页进入后台时调用。
+     * §15 要求 onPause 停止「仅前台需要的」活跃行为，避免后台继续刷接口/占用资源。
+     * 注意：WS 订阅本身由系统服务维持，这里只停掉 UI 相关的轮询类工作，
+     * 不影响实时消息到达。
+     */
+    fun onScreenPaused() {
+        receiptRefreshJob?.cancel()
+        receiptRefreshJob = null
     }
 
     /**
@@ -306,9 +449,18 @@ class ChatViewModel : ViewModel() {
      * Merge incoming messages into existing list (merge not replace).
      * Mirrors DirectMessageMerger.mergeRefresh from original §3.4.
      */
-    private fun mergeMessages(incoming: List<Message>, appendToFront: Boolean = true) {
+    private fun mergeMessages(incomingRaw: List<Message>, appendToFront: Boolean = true) {
         val current = _messages.value.toMutableList()
         var changed = false
+
+        // 消息体归一化：加密通话的帧在这里一次性处理 ——
+        //   · 控制帧（PQC_BEGIN/PQC_REPLY/ENC 控制帧）→ 丢弃，不该出现在消息列表里
+        //   · ENC 消息帧 → 解包成明文后照常合并展示（历史回源/轮询/WS 都会经过这里）
+        val incoming = incomingRaw.mapNotNull { msg ->
+            val plain = callManager.unwrapForDisplay(msg.body, friendUid) ?: return@mapNotNull null
+            if (plain == msg.body) msg else msg.copy(body = plain, encrypted = true)
+        }
+        if (incoming.isEmpty()) return
 
         for (msg in incoming) {
             // 已存在消息（非本地临时消息）：更新 read/delivered 状态（已读回执实时刷新），
@@ -389,10 +541,45 @@ class ChatViewModel : ViewModel() {
     fun sendText(text: String, quoteDraft: Message? = null) {
         if (text.isBlank()) return
 
+        // 加密通话中：消息体先加密成 ENC 帧再走同一个 /direct/send
+        // （enigmaj 的发消息入口就是「查密钥 → 加密 → 发送」，通道不变）
+        when {
+            callManager.isConnectedWith(friendUid) -> Unit // 有密钥，下面直接加密发
+            callManager.isEstablishingWith(friendUid) -> {
+                // 还握手中（没有密钥）：先入队，接通后自动加密补发；若通话失败则明文补发，
+                // 保证用户输入不丢。
+                queuedWhileCalling += text to quoteDraft
+                _callQueueHint.value = "正在建立加密通道，${queuedWhileCalling.size} 条消息将在接通后加密发送"
+                return
+            }
+            else -> Unit // 未通话：明文（与 enigmaj 的「没有必须加密的策略」一致）
+        }
+
+        sendTextInternal(text, quoteDraft)
+    }
+
+    /** 通话期暂存待发文本（密钥就绪或通话结束后统一处理） */
+    private val queuedWhileCalling = mutableListOf<Pair<String, Message?>>()
+    private val _callQueueHint = MutableStateFlow<String?>(null)
+    val callQueueHint: StateFlow<String?> = _callQueueHint.asStateFlow()
+
+    private fun flushCallQueue() {
+        if (queuedWhileCalling.isEmpty()) return
+        val batch = queuedWhileCalling.toList()
+        queuedWhileCalling.clear()
+        _callQueueHint.value = null
+        batch.forEach { (t, q) -> sendTextInternal(t, q) }
+    }
+
+    private fun sendTextInternal(text: String, quoteDraft: Message? = null) {
         val body = MessagePayloadBuilder.buildBody(
             text = text,
             quote = quoteDraft?.let { MessagePayloadBuilder.buildQuote(it) }
         )
+
+        // 已接通 → 包成 ENC 帧；没有密钥则原样明文
+        val frame = callManager.wrapMessage(friendUid, body)
+        val wireBody = frame ?: body
 
         val localId = "local_${localIdCounter.incrementAndGet()}"
 
@@ -406,7 +593,8 @@ class ChatViewModel : ViewModel() {
             createdAt = System.currentTimeMillis() / 1000,
             status = Message.STATUS_NONE,
             isLocalPending = true,
-            localRequestId = localId
+            localRequestId = localId,
+            encrypted = frame != null
         )
 
         // Add to list immediately
@@ -420,14 +608,18 @@ class ChatViewModel : ViewModel() {
                 body = gson.toJson(
                     mapOf(
                         "to_uid" to friendUid,
-                        "body" to body,
+                        "body" to wireBody,
                         "msg_type" to "text"
                     )
                 )
             )
             result.fold(
                 onSuccess = { responseBody ->
-                    val sent = parseSingleMessage(responseBody)
+                    // 服务端确认里带的是 ENC 帧（wireBody），本地展示要用明文 body
+                    val sent = parseSingleMessage(responseBody)?.copy(
+                        body = body,
+                        encrypted = frame != null
+                    )
                     if (sent != null) {
                         completePending(localId, sent)
                     } else {
@@ -702,12 +894,66 @@ class ChatViewModel : ViewModel() {
 
     // ---- Read Receipt ----
 
+    /**
+     * ALIGN-11：已读上报加 3 秒防抖 + 合并。
+     * 原来每次消息变化/滚动事件都会直接 POST /direct/read，
+     * 聊天密集时等于给自己刷请求（违反 §0 反滥用红线）。
+     */
     fun markRead() {
+        lastReadRequestAt = System.currentTimeMillis()
+        markReadJob?.cancel()
+        markReadJob = viewModelScope.launch {
+            delay(MARK_READ_DEBOUNCE_MS)
+            try {
+                apiClient.post(
+                    "/direct/read",
+                    gson.toJson(mapOf("thread_id" to threadId))
+                )
+            } catch (_: Exception) {
+                // 静默：下次标记时会再试
+            }
+        }
+    }
+
+    /**
+     * ALIGN-13：向上翻页加载更早历史（进入会话只拉最新一页）。
+     */
+    fun loadMoreHistory() {
+        if (isLoadingMoreHistory || !historyHasMore) return
+        val oldest = _messages.value.minByOrNull { it.createdAt } ?: return
+        isLoadingMoreHistory = true
         viewModelScope.launch {
-            apiClient.post(
-                "/direct/read",
-                gson.toJson(mapOf("thread_id" to threadId))
-            )
+            try {
+                if (loadedPages >= MAX_HISTORY_PAGES) {
+                    historyHasMore = false
+                    return@launch
+                }
+                val params = mutableMapOf(
+                    "with_uid" to friendUid,
+                    "limit" to HISTORY_PAGE_SIZE.toString()
+                )
+                // 游标：优先用服务端认可的消息 id，其次用序号
+                if (oldest.id.isNotEmpty() && !oldest.isLocalPending) {
+                    params["before_msg_id"] = oldest.id
+                }
+                params["before_seq"] = oldest.sortSeq.toString()
+
+                apiClient.get("/direct/messages/v2", params).onSuccess { body ->
+                    val older = parseMessages(body)
+                    if (older.isEmpty()) {
+                        historyHasMore = false
+                    } else {
+                        loadedPages += 1
+                        mergeMessages(older, appendToFront = true)
+                        historyHasMore = older.size >= HISTORY_PAGE_SIZE &&
+                            loadedPages < MAX_HISTORY_PAGES
+                    }
+                }
+            } catch (_: Exception) {
+                historyHasMore = false
+            } finally {
+                isLoadingMoreHistory = false
+            }
         }
     }
 
@@ -733,6 +979,30 @@ class ChatViewModel : ViewModel() {
         }
     }
 
+    // ---- 加密通话（enigmaj 同构的 PQC 握手 + AES-256-GCM 帧） ----
+
+    private val callManager get() = app.encryptedCallManager
+    val callState = app.encryptedCallManager.state
+    val callElapsedSeconds = app.encryptedCallManager.elapsedSeconds
+    val callSystemText = app.encryptedCallManager.systemText
+
+    /** 拨出/挂断都由界面调用；第二次点击 = 挂断（界面负责先弹确认） */
+    fun startEncryptedCall() {
+        if (friendUid.isBlank()) return
+        callManager.start(friendUid)
+    }
+
+    fun hangUpEncryptedCall() {
+        callManager.hangUp()
+    }
+
+    fun dismissCallResult() {
+        callManager.acknowledgeEnded()
+    }
+
+    /** 当前会话是否正在加密通话中 */
+    fun isInEncryptedCall(): Boolean = callManager.isInCallWith(friendUid)
+
     // ---- Receive WS Messages ----
 
     fun onWsMessage(message: Message) {
@@ -745,6 +1015,17 @@ class ChatViewModel : ViewModel() {
             message.threadId == threadId ||
             message.fromUid == myUid // 自己发送的回显
         if (!belongsCurrent) return
+
+        // 加密通话的控制帧（PQC_BEGIN / PQC_REPLY / ENC）交给通话层消费：
+        // 它们不该出现在聊天气泡里，也不该写进消息缓存。
+        // 收到 PQC_BEGIN 时通话层会自动回 PQC_REPLY（与 enigmaj 的响应方行为一致）。
+        // 加密通话的控制帧不展示为聊天气泡、也不写入消息缓存。
+        // 帧的**处理**统一在 WebSocketManager.routeE2eFrame（网络层单点），
+        // 这样对方不在会话页时也能接起来电；这里只负责过滤。
+        if (E2eFrame.isE2e(message.body)) return
+
+        // ALIGN-02：收到本会话实时消息 → 合并触发一次回执刷新（替代 5s 轮询）
+        triggerReceiptRefresh()
 
         // 若拿到真实 thread_id，补全本地 threadId（此前初始化为 uid，可能不准确）
         if (message.threadId.isNotEmpty() && threadId != message.threadId) {
@@ -770,8 +1051,21 @@ class ChatViewModel : ViewModel() {
     companion object {
         const val MAX_ACTIVE_WINDOW = 200
 
-        // 已读回执刷新间隔（毫秒）。单聊 /direct/messages/v2 返回 delivered_at/read_at，
-        // 周期刷新保证对方读取后，自己发出的消息能实时显示「已读/送达」对号。
-        const val RECEIPT_REFRESH_INTERVAL_MS = 5_000L
+        /**
+         * ALIGN-02：回执刷新的合并窗口（毫秒）。事件驱动 + 去抖，
+         * 取代原来的 5 秒固定轮询。
+         */
+        const val RECEIPT_REFRESH_DEBOUNCE_MS = 1_500L
+
+        /** ALIGN-11：已读上报防抖窗口 */
+        const val MARK_READ_DEBOUNCE_MS = 3_000L
+
+        /** ALIGN-15：输入中上报节流窗口 / 对方输入状态自动过期时间 */
+        const val TYPING_THROTTLE_MS = 2_500L
+        const val TYPING_TIMEOUT_MS = 6_000L
+
+        /** ALIGN-13：历史分页页大小与最大页数（对齐 §3.1「最多 150 条」） */
+        const val HISTORY_PAGE_SIZE = 30
+        const val MAX_HISTORY_PAGES = 5
     }
 }

@@ -42,6 +42,11 @@ class NotificationsViewModel : ViewModel() {
 
     private var loaded = false
 
+    // ALIGN-16：已读状态与红点。原来 lastReadNotificationId 只写不读，
+    // 通知中心永远显示「未读」，用户点开也消不掉。
+    private val _hasUnread = MutableStateFlow(false)
+    val hasUnread: StateFlow<Boolean> = _hasUnread.asStateFlow()
+
     fun loadIfEmpty() {
         if (loaded) return
         refresh()
@@ -80,8 +85,13 @@ class NotificationsViewModel : ViewModel() {
         // 按时间倒序（最新在前）
         _notifications.value = items.sortedByDescending { it.createdAt }
 
-        // 异步决定是否弹重要通知：最新一条 important 且未被"不再提示"
-        viewModelScope.launch { resolveImportantNotice() }
+        // ALIGN-16：红点 = 存在比「上次已读时间」更新的通知
+        // （偏好项 lastReadNotificationId 的实际类型是 Long 时间戳，不是通知 id）
+        viewModelScope.launch {
+            val lastReadAt = app.cacheManager.preferences.lastReadNotificationId.first()
+            _hasUnread.value = _notifications.value.any { it.createdAt > lastReadAt }
+            resolveImportantNotice()
+        }
     }
 
     /** 找到应弹出的最新重要通知。 */
@@ -92,6 +102,15 @@ class NotificationsViewModel : ViewModel() {
         }
         val dismissedId = app.cacheManager.preferences.dismissedImportantNotificationId.first()
         _importantNotice.value = if (latestImportant.id != dismissedId) latestImportant else null
+    }
+
+    /** ALIGN-16：用户看完通知中心 → 记录最新一条 id，红点消失。 */
+    fun markAllRead() {
+        val newest = _notifications.value.firstOrNull() ?: return
+        viewModelScope.launch {
+            app.cacheManager.preferences.setLastReadNotificationId(newest.createdAt)
+            _hasUnread.value = false
+        }
     }
 
     /** 用户勾选"不再提示"后，记录该条 important 通知 id。 */

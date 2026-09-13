@@ -32,7 +32,14 @@ class MessageReceiver(
 ) {
     companion object {
         private const val TAG = "MessageReceiver"
-        private const val POLL_INTERVAL_MS = 5_000L
+        /**
+         * 兜底轮询间隔。走的是 /updates/difference 增量游标（不是朴素全量刷新），
+         * 但没必要 5 秒一次：
+         *   WS 已连接 → 只当保险，30s 一次；
+         *   WS 断开   → 15s 一次（仍远低于原来的 5s 固定频率）。
+         */
+        private const val POLL_INTERVAL_WS_UP_MS = 30_000L
+        private const val POLL_INTERVAL_WS_DOWN_MS = 15_000L
     }
 
     enum class Mode(val key: String, val label: String) {
@@ -51,13 +58,24 @@ class MessageReceiver(
     private var modeJob: Job? = null
     private var pollingObserverJob: Job? = null
 
-    // 已投递消息去重（避免轮询重复触发）
-    private val seenDirectIds = java.util.Collections.newSetFromMap(
-        java.util.concurrent.ConcurrentHashMap<String, Boolean>()
-    )
-    private val seenGroupIds = java.util.Collections.newSetFromMap(
-        java.util.concurrent.ConcurrentHashMap<String, Boolean>()
-    )
+    // BUG-16：轮询复用同一个 ApiClient，不再每 5s 新建（原来会连带新建 Ktor/ECDH 状态、
+    // 且每次都要 ensureSession）。
+    private val apiClient by lazy {
+        ApiClient(OldChatApplication.instance.serverConfig, authManager, gson)
+    }
+
+    // 已投递消息去重（避免轮询重复触发）。
+    // BUG-16：改成有上限的 LRU 集合，原来是无界 Set，长跑必然内存泄漏。
+    private class BoundedIdSet(private val maxSize: Int) {
+        private val map = object : LinkedHashMap<String, Boolean>(64, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Boolean>?) =
+                size > maxSize
+        }
+        fun add(id: String): Boolean = synchronized(map) { map.put(id, true) == null }
+    }
+
+    private val seenDirectIds = BoundedIdSet(2_000)
+    private val seenGroupIds = BoundedIdSet(2_000)
 
     /** 当前生效的模式（供 UI 观察） */
     private val _currentMode = MutableStateFlow(Mode.WS_PRIORITY)
@@ -117,10 +135,17 @@ class MessageReceiver(
         pollJob = scope.launch {
             while (isActive) {
                 pollOnce()
-                delay(POLL_INTERVAL_MS)
+                delay(pollInterval())
             }
         }
     }
+
+    private fun pollInterval(): Long =
+        if (wsManager.connectionState.value == WebSocketManager.ConnectionState.CONNECTED) {
+            POLL_INTERVAL_WS_UP_MS
+        } else {
+            POLL_INTERVAL_WS_DOWN_MS
+        }
 
     private fun stopPolling() {
         pollJob?.cancel()
@@ -130,9 +155,6 @@ class MessageReceiver(
     /** 执行一次 HTTP 轮询：拉直聊 + 群聊未读消息。 */
     private suspend fun pollOnce() {
         try {
-            val apiClient = ApiClient(
-                OldChatApplication.instance.serverConfig, authManager, gson
-            )
             apiClient.ensureSession()
 
             // 直聊未读

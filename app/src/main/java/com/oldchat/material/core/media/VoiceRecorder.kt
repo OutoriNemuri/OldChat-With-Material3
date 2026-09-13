@@ -101,8 +101,13 @@ class VoiceRecorder(private val context: Context) {
                 "${context.packageName}.fileprovider",
                 file
             )
-        } catch (_: Exception) {
-            Uri.fromFile(file)
+        } catch (e: Exception) {
+            // FileProvider 已在 AndroidManifest 注册（BUG-02）。
+            // 这里不再回退 file:// —— 那会在分享/通知等场景抛 FileUriExposedException，
+            // 把失败显式暴露出来，调用方按 null 处理即可。
+            android.util.Log.e("VoiceRecorder", "FileProvider failed for ${file.absolutePath}", e)
+            outputFile = null
+            return null
         }
 
         return Pair(uri, durationMs)

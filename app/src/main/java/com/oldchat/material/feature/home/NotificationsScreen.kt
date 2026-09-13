@@ -1,5 +1,6 @@
 package com.oldchat.material.feature.home
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -35,12 +36,34 @@ fun NotificationsScreen(
     val notifications by viewModel.notifications.collectAsStateWithLifecycle()
     val isLoading by viewModel.isLoading.collectAsStateWithLifecycle()
 
+    val hasUnread by viewModel.hasUnread.collectAsStateWithLifecycle()
+
     LaunchedEffect(Unit) { viewModel.loadIfEmpty() }
+
+    // ALIGN-16：打开通知中心即视为已读（写入本地记录，红点随之消失）
+    LaunchedEffect(notifications.size) {
+        if (notifications.isNotEmpty()) viewModel.markAllRead()
+    }
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("系统通知") },
+                title = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("系统通知")
+                        if (hasUnread) {
+                            Spacer(Modifier.width(8.dp))
+                            Box(
+                                modifier = Modifier
+                                    .size(8.dp)
+                                    .background(
+                                        MaterialTheme.colorScheme.error,
+                                        androidx.compose.foundation.shape.CircleShape
+                                    )
+                            )
+                        }
+                    }
+                },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.Filled.ArrowBack, "返回")

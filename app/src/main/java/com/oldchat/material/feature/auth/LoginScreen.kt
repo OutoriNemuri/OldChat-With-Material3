@@ -12,6 +12,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.*
+import com.oldchat.material.OldChatApplication
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -30,6 +31,10 @@ fun LoginScreen(
     onLoginSuccess: () -> Unit = {},
     viewModel: AuthViewModel = viewModel()
 ) {
+
+    // ALIGN-09：协议弹窗开关
+
+    var showPolicyDialog by remember { mutableStateOf(false) }
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
     val context = androidx.compose.ui.platform.LocalContext.current
@@ -96,7 +101,11 @@ private fun openRegister(context: android.content.Context) {
     try {
         val intent = android.content.Intent(
             android.content.Intent.ACTION_VIEW,
-            android.net.Uri.parse("https://oc.mcl0.dpdns.org/register")
+            // ALIGN-25：不再硬编码域名。注册已迁到网页端（服务端返回 register_url），
+            // 这里按当前服务器配置拼接，换服务器/自建部署后依然正确。
+            android.net.Uri.parse(
+                OldChatApplication.instance.serverConfig.resolveRegisterUrl()
+            )
         )
         context.startActivity(intent)
     } catch (_: Exception) {
@@ -112,6 +121,10 @@ private fun LoginCard(
     uiState: AuthUiState,
     onOpenRegister: () -> Unit = {}
 ) {
+    // ALIGN-09：隐私协议弹窗状态与跳转用 context（本 composable 内需要）
+    var showPolicyDialog by remember { mutableStateOf(false) }
+    val context = androidx.compose.ui.platform.LocalContext.current
+
     Card(
         modifier = Modifier
             .fillMaxWidth()
@@ -213,7 +226,9 @@ private fun LoginCard(
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 TextButton(
-                    onClick = { /* TODO: Open privacy policy */ },
+                    // ALIGN-09：原来这里是 TODO（点了没反应），而勾选框又是强制门禁，
+                    // 用户「同意」的到底是什么完全没有出处。现在打开协议弹窗。
+                    onClick = { showPolicyDialog = true },
                     modifier = Modifier.height(32.dp),
                     contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp)
                 ) {
@@ -223,6 +238,46 @@ private fun LoginCard(
                         color = MaterialTheme.colorScheme.primary
                     )
                 }
+            }
+
+            // ALIGN-09：隐私协议弹窗（本地摘要 + 跳转官网完整条款）
+            if (showPolicyDialog) {
+                AlertDialog(
+                    onDismissRequest = { showPolicyDialog = false },
+                    title = { Text("隐私协议与用户条款") },
+                    text = {
+                        Column {
+                            Text(
+                                "使用本客户端即表示你理解并同意：\n\n" +
+                                "· 账号信息与消息内容由你连接的 Oldchat 服务器处理，客户端仅在本地缓存必要的会话数据；\n" +
+                                "· 客户端不会在未经你操作的情况下上传通讯录/相册等隐私数据；\n" +
+                                "· 本地缓存可通过「设置 → 清除缓存」随时删除。\n\n" +
+                                "完整条款以服务方页面为准。",
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                        }
+                    },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            showPolicyDialog = false
+                            runCatching {
+                                val ctx = context
+                                ctx.startActivity(
+                                    android.content.Intent(
+                                        android.content.Intent.ACTION_VIEW,
+                                        android.net.Uri.parse(
+                                            OldChatApplication.instance.serverConfig
+                                                .resolveRegisterUrl().removeSuffix("/register")
+                                        )
+                                    )
+                                )
+                            }
+                        }) { Text("查看完整条款") }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showPolicyDialog = false }) { Text("关闭") }
+                    }
+                )
             }
 
             // Login button

@@ -1,0 +1,303 @@
+package com.oldchat.material.core.e2e
+
+import android.util.Base64
+import java.security.KeyFactory
+import java.security.KeyPairGenerator
+import java.security.MessageDigest
+import java.security.SecureRandom
+import java.security.spec.ECGenParameterSpec
+import java.security.spec.PKCS8EncodedKeySpec
+import java.security.spec.X509EncodedKeySpec
+import javax.crypto.Cipher
+import javax.crypto.KeyAgreement
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
+
+/**
+ * enigmaj 的线上帧格式（来自 shared/enigmaj-re/REPORT.md §7.2 / §8，100% 实测）：
+ *
+ * - `PQC_BEGIN\n<base64 ek>`  发起方公钥（ML-KEM-768 封装公钥 1184 B → 1580 字符 base64）
+ * - `PQC_REPLY\n<base64 ct>`  响应方密文（ML-KEM-768 密文 1088 B → 1452 字符 base64）
+ * - `ENC\n<base64 payload>`   AEAD 载荷，payload = nonce(12) ‖ ciphertext ‖ tag(16)
+ * - 其它                       明文
+ *
+ * 本客户端**逐字对齐**这套前缀与载荷布局，因此两侧对同一帧的判定完全一致。
+ */
+object E2eFrame {
+    const val PQC_BEGIN = "PQC_BEGIN\n"
+    const val PQC_REPLY = "PQC_REPLY\n"
+    const val ENC = "ENC\n"
+
+    /** enigmaj 的 `密文长度不足` 阈值：12 nonce + 16 tag = 28 B */
+    const val MIN_PAYLOAD = 28
+
+    enum class Kind { PQC_BEGIN, PQC_REPLY, ENC, PLAIN }
+
+    fun kind(body: String): Kind = when {
+        body.startsWith(PQC_BEGIN) -> Kind.PQC_BEGIN
+        body.startsWith(PQC_REPLY) -> Kind.PQC_REPLY
+        body.startsWith(ENC) -> Kind.ENC
+        else -> Kind.PLAIN
+    }
+
+    fun isE2e(body: String): Boolean = kind(body) != Kind.PLAIN
+
+    fun payloadOf(body: String, kind: Kind): String = when (kind) {
+        Kind.PQC_BEGIN -> body.removePrefix(PQC_BEGIN)
+        Kind.PQC_REPLY -> body.removePrefix(PQC_REPLY)
+        Kind.ENC -> body.removePrefix(ENC)
+        Kind.PLAIN -> body
+    }
+
+    fun encode(kind: Kind, payload: ByteArray): String =
+        when (kind) {
+            Kind.PQC_BEGIN -> PQC_BEGIN
+            Kind.PQC_REPLY -> PQC_REPLY
+            Kind.ENC -> ENC
+            Kind.PLAIN -> ""
+        } + Base64.encodeToString(payload, Base64.NO_WRAP)
+}
+
+/** KEM 抽象。enigmaj 用 ML-KEM-768；实现见 MlKem768Kem / EcdhP256Kem。 */
+interface E2eKem {
+    /** 展示用算法名 */
+    val id: String
+
+    /** 本实现的公钥字节长度（用于接收端自动识别对端用的是哪种 KEM） */
+    val publicKeySize: Int
+
+    fun generateKeyPair(): E2eKeyPair
+
+    /** 发起方：用对端公钥封装，得到密文与 32 B 共享密钥 */
+    fun encapsulate(peerPublicKey: ByteArray): E2eEncapsulation?
+
+    /** 响应方：用自己的私钥解封装 */
+    fun decapsulate(ciphertext: ByteArray, privateKey: ByteArray): ByteArray?
+}
+
+data class E2eKeyPair(val publicKey: ByteArray, val privateKey: ByteArray)
+
+data class E2eEncapsulation(val ciphertext: ByteArray, val sharedSecret: ByteArray)
+
+/**
+ * ML-KEM-768（FIPS 203），与 enigmaj 完全一致的 KEM。
+ *
+ * Android 没有内置 ML-KEM，这里用 BouncyCastle 的 `bcprov-jdk18on`（1.78+ 起提供
+ * `org.bouncycastle.pqc.crypto.mlkem.*`）。为避免「依赖/类名/构造参数顺序差异」导致
+ * **编译**失败，全部通过反射调用：
+ *   - 类不存在 → [available] 为 false → 上层自动降级到 [EcdhP256Kem]；
+ *   - 构造顺序不匹配 → 按参数个数 + 可赋值性自动挑选匹配的构造器。
+ * 帧格式与 SS 长度与 enigmaj 完全一致（ek 1184 B、ct 1088 B、SS 32 B）。
+ */
+class MlKem768Kem : E2eKem {
+
+    override val id = "ML-KEM-768"
+    override val publicKeySize = 1184
+
+    private class Refs(
+        val params: Class<*>,
+        val kpg: Class<*>,
+        val kgp: Class<*>,
+        val gen: Class<*>,
+        val ext: Class<*>,
+        val pub: Class<*>,
+        val priv: Class<*>,
+        val asymmetricKeyParameter: Class<*>
+    )
+
+    private val refs: Refs? = runCatching {
+        Refs(
+            params = Class.forName("org.bouncycastle.pqc.crypto.mlkem.MLKEMParameters"),
+            kpg = Class.forName("org.bouncycastle.pqc.crypto.mlkem.MLKEMKeyPairGenerator"),
+            kgp = Class.forName("org.bouncycastle.pqc.crypto.mlkem.MLKEMKeyGenerationParameters"),
+            gen = Class.forName("org.bouncycastle.pqc.crypto.mlkem.MLKEMGenerator"),
+            ext = Class.forName("org.bouncycastle.pqc.crypto.mlkem.MLKEMExtractor"),
+            pub = Class.forName("org.bouncycastle.pqc.crypto.mlkem.MLKEMPublicKeyParameters"),
+            priv = Class.forName("org.bouncycastle.pqc.crypto.mlkem.MLKEMPrivateKeyParameters"),
+            asymmetricKeyParameter = Class.forName("org.bouncycastle.crypto.params.AsymmetricKeyParameter")
+        )
+    }.getOrNull()
+
+    /** BouncyCastle 的 ML-KEM 是否可用（不可用时上层降级 ECDH P-256） */
+    val available: Boolean get() = refs != null
+
+    private fun params768(): Any? = runCatching {
+        refs!!.params.getField("ml_kem_768").get(null)
+    }.getOrNull()
+
+    override fun generateKeyPair(): E2eKeyPair {
+        val r = refs ?: return E2eKeyPair(ByteArray(0), ByteArray(0))
+        val params = params768() ?: return E2eKeyPair(ByteArray(0), ByteArray(0))
+
+        val kpg = construct(r.kpg) ?: return E2eKeyPair(ByteArray(0), ByteArray(0))
+        val kgp = construct(r.kgp, SecureRandom(), params)
+            ?: construct(r.kgp, params, SecureRandom())
+            ?: return E2eKeyPair(ByteArray(0), ByteArray(0))
+        invoke(kpg, "init", kgp) ?: return E2eKeyPair(ByteArray(0), ByteArray(0))
+
+        val pair = invoke(kpg, "generateKeyPair") ?: return E2eKeyPair(ByteArray(0), ByteArray(0))
+        val pub = invoke(pair, "getPublic") ?: return E2eKeyPair(ByteArray(0), ByteArray(0))
+        val priv = invoke(pair, "getPrivate") ?: return E2eKeyPair(ByteArray(0), ByteArray(0))
+        val pubBytes = (invoke(pub, "getEncoded") as? ByteArray)
+            ?: return E2eKeyPair(ByteArray(0), ByteArray(0))
+        val privBytes = (invoke(priv, "getEncoded") as? ByteArray)
+            ?: return E2eKeyPair(ByteArray(0), ByteArray(0))
+        return E2eKeyPair(pubBytes, privBytes)
+    }
+
+    override fun encapsulate(peerPublicKey: ByteArray): E2eEncapsulation? {
+        val r = refs ?: return null
+        val params = params768() ?: return null
+        val peerPub = construct(r.pub, params, peerPublicKey) ?: return null
+        val generator = construct(r.gen, SecureRandom()) ?: return null
+        val encapsulated = invokeTyped(generator, "generateEncapsulated", r.asymmetricKeyParameter, peerPub)
+            ?: return null
+        val ct = invoke(encapsulated, "getEncapsulation") as? ByteArray ?: return null
+        val ss = invoke(encapsulated, "getSecret") as? ByteArray ?: return null
+        return E2eEncapsulation(ct, ss)
+    }
+
+    override fun decapsulate(ciphertext: ByteArray, privateKey: ByteArray): ByteArray? {
+        val r = refs ?: return null
+        val params = params768() ?: return null
+        val priv = construct(r.priv, params, privateKey) ?: return null
+        val extractor = construct(r.ext, priv) ?: return null
+        return invokeTyped(extractor, "extractSecret", ByteArray::class.java, ciphertext) as? ByteArray
+    }
+
+    // ---- 反射小工具（容错：不依赖构造参数顺序、不依赖方法重载签名） ----
+
+    private fun construct(cls: Class<*>, vararg args: Any): Any? {
+        for (ctor in cls.constructors) {
+            if (ctor.parameterCount != args.size) continue
+            val types = ctor.parameterTypes
+            var ok = true
+            for (i in args.indices) {
+                val t = types[i]
+                val a = args[i]
+                val assignable = t.isInstance(a) ||
+                    (t.isPrimitive && (
+                        (t == Int::class.javaPrimitiveType && a is Int) ||
+                            (t == Long::class.javaPrimitiveType && a is Long) ||
+                            (t == Boolean::class.javaPrimitiveType && a is Boolean)
+                        ))
+                if (!assignable) { ok = false; break }
+            }
+            if (!ok) continue
+            runCatching { return ctor.newInstance(*args) }
+        }
+        return null
+    }
+
+    private fun invoke(target: Any, name: String): Any? =
+        runCatching {
+            target.javaClass.methods.firstOrNull { it.name == name && it.parameterCount == 0 }
+                ?.invoke(target)
+        }.getOrNull()
+
+    private fun invoke(target: Any, name: String, arg: Any): Any? =
+        runCatching {
+            target.javaClass.methods.firstOrNull {
+                it.name == name && it.parameterCount == 1 && it.parameterTypes[0].isInstance(arg)
+            }?.invoke(target, arg)
+        }.getOrNull()
+
+    private fun invokeTyped(target: Any, name: String, type: Class<*>, arg: Any): Any? =
+        runCatching {
+            target.javaClass.methods.firstOrNull {
+                it.name == name && it.parameterCount == 1 && it.parameterTypes[0].isAssignableFrom(type)
+            }?.invoke(target, arg)
+        }.getOrNull()
+}
+
+/**
+ * 降级 KEM：ECDH P-256 + SHA-256 → 32 B 共享密钥（与 ML-KEM 的 SS 长度一致）。
+ *
+ * 与 ML-KEM 的区别只有「密钥封装原语」本身，帧格式、SS 长度、AEAD（AES-256-GCM）
+ * 与 enigmaj 完全一致：
+ * - 发起方 `PQC_BEGIN` 载荷 = 自己的 P-256 公钥（X.509 SPKI DER，91 B）
+ * - 响应方 `PQC_REPLY` 载荷 = 临时 P-256 公钥（91 B），SS = SHA-256(ECDH 共享点)
+ * 接收端按载荷长度自动区分（1184 → ML-KEM-768；约 91 → P-256）。
+ */
+class EcdhP256Kem : E2eKem {
+
+    override val id = "ECDH-P256(降级)"
+    override val publicKeySize = 91
+
+    override fun generateKeyPair(): E2eKeyPair {
+        val kpg = KeyPairGenerator.getInstance("EC")
+        kpg.initialize(ECGenParameterSpec("secp256r1"))
+        val kp = kpg.generateKeyPair()
+        return E2eKeyPair(kp.public.encoded, kp.private.encoded)
+    }
+
+    override fun encapsulate(peerPublicKey: ByteArray): E2eEncapsulation? = runCatching {
+        val peerPub = KeyFactory.getInstance("EC")
+            .generatePublic(X509EncodedKeySpec(peerPublicKey))
+        val ephemeral = generateKeyPair()
+        val ephPriv = KeyFactory.getInstance("EC")
+            .generatePrivate(PKCS8EncodedKeySpec(ephemeral.privateKey))
+        val ss = ecdh(ephPriv, peerPub) ?: return null
+        E2eEncapsulation(ephemeral.publicKey, ss)
+    }.getOrNull()
+
+    override fun decapsulate(ciphertext: ByteArray, privateKey: ByteArray): ByteArray? = runCatching {
+        val priv = KeyFactory.getInstance("EC").generatePrivate(PKCS8EncodedKeySpec(privateKey))
+        val peerEphPub = KeyFactory.getInstance("EC").generatePublic(X509EncodedKeySpec(ciphertext))
+        ecdh(priv, peerEphPub)
+    }.getOrNull()
+
+    private fun ecdh(priv: java.security.PrivateKey, pub: java.security.PublicKey): ByteArray? = runCatching {
+        val ka = KeyAgreement.getInstance("ECDH")
+        ka.init(priv)
+        ka.doPhase(pub, true)
+        // 32 B：与 ML-KEM 的 SS 长度对齐
+        MessageDigest.getInstance("SHA-256").digest(ka.generateSecret())
+    }.getOrNull()
+}
+
+/** AES-256-GCM：载荷布局 nonce(12) ‖ ciphertext ‖ tag(16)，与 enigmaj 一致。 */
+object E2eAead {
+
+    private const val NONCE_LEN = 12
+    private const val TAG_BITS = 128
+
+    fun encrypt(sharedSecret: ByteArray, plaintext: ByteArray): ByteArray? = runCatching {
+        val nonce = ByteArray(NONCE_LEN).also { SecureRandom().nextBytes(it) }
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(
+            Cipher.ENCRYPT_MODE,
+            SecretKeySpec(normalizeKey(sharedSecret), "AES"),
+            GCMParameterSpec(TAG_BITS, nonce)
+        )
+        nonce + cipher.doFinal(plaintext)
+    }.getOrNull()
+
+    fun decrypt(sharedSecret: ByteArray, payload: ByteArray): ByteArray? {
+        // enigmaj：长度 ≤27 直接判「密文长度不足」
+        if (payload.size < E2eFrame.MIN_PAYLOAD) return null
+        return runCatching {
+            val nonce = payload.copyOfRange(0, NONCE_LEN)
+            val body = payload.copyOfRange(NONCE_LEN, payload.size)
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(
+                Cipher.DECRYPT_MODE,
+                SecretKeySpec(normalizeKey(sharedSecret), "AES"),
+                GCMParameterSpec(TAG_BITS, nonce)
+            )
+            cipher.doFinal(body)
+        }.getOrNull()
+    }
+
+    /** 固定成 32 B AES-256 密钥（ML-KEM/E 的 SS 本身就是 32 B，ECDH 侧已 SHA-256） */
+    private fun normalizeKey(secret: ByteArray): ByteArray =
+        if (secret.size == 32) secret else MessageDigest.getInstance("SHA-256").digest(secret)
+}
+
+/** 会话密钥的人类可读指纹（双方相同即证明握手一致）。 */
+object E2eFingerprint {
+    fun of(sharedSecret: ByteArray): String {
+        val digest = MessageDigest.getInstance("SHA-256").digest(sharedSecret)
+        return digest.take(8).joinToString("") { "%02X".format(it) }
+    }
+}

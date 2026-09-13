@@ -29,6 +29,16 @@ object MediaUploader {
     private const val THUMB_MAX_WIDTH = 300
     private const val THUMB_MAX_HEIGHT = 300
 
+    /** BUG-10：用 ContentResolver 元数据查询大小，避免为了判断大小而读取整个文件。 */
+    private fun querySize(context: Context, uri: Uri): Long {
+        return try {
+            context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { it.length }
+                ?: -1L
+        } catch (_: Exception) {
+            -1L
+        }
+    }
+
     data class UploadResult(
         val url: String,
         val thumbUrl: String? = null
@@ -99,13 +109,9 @@ object MediaUploader {
                     android.media.MediaMetadataRetriever.METADATA_KEY_DURATION
                 )
 
-                // Check size
-                val inputStream = context.contentResolver.openInputStream(uri)
-                    ?: return@withContext Result.failure(Exception("Cannot open video"))
-                val bytes = inputStream.readBytes()
-                inputStream.close()
-
-                if (bytes.size > MAX_MEDIA_BYTES) {
+                // BUG-10 / ALIGN-08：大小用 ContentResolver 元数据查询，不再把整个视频读进内存
+                val videoSize = querySize(context, uri)
+                if (videoSize > MAX_MEDIA_BYTES) {
                     retriever.release()
                     return@withContext Result.failure(Exception("视频过大，请选择小于 50MB 的视频"))
                 }
@@ -126,8 +132,17 @@ object MediaUploader {
                 retriever.release()
 
                 val app = OldChatApplication.instance
-                val parts = mutableListOf(
-                    FormPartData.FilePart("file", bytes, "video.mp4", "video/mp4")
+                val parts = mutableListOf<FormPartData>(
+                    FormPartData.StreamPart(
+                        key = "file",
+                        fileName = "video.mp4",
+                        mimeType = "video/mp4",
+                        size = videoSize,
+                        openStream = {
+                            context.contentResolver.openInputStream(uri)
+                                ?: java.io.ByteArrayInputStream(ByteArray(0))
+                        }
+                    )
                 )
                 if (thumbBytes != null) {
                     parts.add(FormPartData.FilePart("thumb", thumbBytes, "thumb.jpg", "image/jpeg"))
@@ -152,14 +167,20 @@ object MediaUploader {
     suspend fun uploadVoice(context: Context, uri: Uri): Result<UploadResult> {
         return withContext(Dispatchers.IO) {
             try {
-                val inputStream = context.contentResolver.openInputStream(uri)
-                    ?: return@withContext Result.failure(Exception("Cannot open audio"))
-                val bytes = inputStream.readBytes()
-                inputStream.close()
-
+                // BUG-10：语音也走流式（原来整段音频 readBytes 进内存）
+                val audioSize = querySize(context, uri)
                 val app = OldChatApplication.instance
-                val parts = listOf(
-                    FormPartData.FilePart("file", bytes, "voice.aac", "audio/aac")
+                val parts = listOf<FormPartData>(
+                    FormPartData.StreamPart(
+                        key = "file",
+                        fileName = "voice.aac",
+                        mimeType = "audio/aac",
+                        size = audioSize,
+                        openStream = {
+                            context.contentResolver.openInputStream(uri)
+                                ?: java.io.ByteArrayInputStream(ByteArray(0))
+                        }
+                    )
                 )
                 app.apiClient.postMultipart("/media", parts).map { body ->
                     val map = app.gson.fromJson(body, Map::class.java) as? Map<*, *>
@@ -188,14 +209,20 @@ object MediaUploader {
 
         return withContext(Dispatchers.IO) {
             try {
-                val inputStream = context.contentResolver.openInputStream(uri)
-                    ?: return@withContext Result.failure(Exception("Cannot open file"))
-                val bytes = inputStream.readBytes()
-                inputStream.close()
-
+                // BUG-10：注释写着「chunked streaming」，实现却是 readBytes() 全量进内存，
+                // 上限还给到 1GB —— 直接 OOM。现在真正走流式。
                 val app = OldChatApplication.instance
-                val parts = listOf(
-                    FormPartData.FilePart("file", bytes, fileName, mimeType)
+                val parts = listOf<FormPartData>(
+                    FormPartData.StreamPart(
+                        key = "file",
+                        fileName = fileName,
+                        mimeType = mimeType,
+                        size = fileSize,
+                        openStream = {
+                            context.contentResolver.openInputStream(uri)
+                                ?: java.io.ByteArrayInputStream(ByteArray(0))
+                        }
+                    )
                 )
                 app.apiClient.postMultipart("/media", parts).map { body ->
                     val map = app.gson.fromJson(body, Map::class.java) as? Map<*, *>

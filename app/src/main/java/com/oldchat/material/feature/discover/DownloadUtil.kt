@@ -114,9 +114,21 @@ object DownloadUtil {
         }
     }
 
-    @Suppress("DEPRECATION")
+    /**
+     * BUG-18：Android 9 及以下。
+     *
+     * 原来直写 `Environment.getExternalStoragePublicDirectory(DOWNLOADS)`，
+     * 而 `WRITE_EXTERNAL_STORAGE` 从未做运行时申请 —— 结果在 API 24~28 上
+     * 「下载完成」提示照弹，文件其实没落盘（或被系统静默拒绝）。
+     *
+     * 现在改写到应用自己的外部目录（`Android/data/<pkg>/files/Download`），
+     * 该路径不需要任何权限，且卸载应用时会一起清掉，不会污染用户公共目录。
+     * 若要写公共下载目录，须先申请 WRITE_EXTERNAL_STORAGE 再改回这里。
+     */
     private fun saveToLegacyDownloads(fileName: String, bytes: ByteArray): String? {
-        val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        val ctx = OldChatApplication.instance
+        val dir = ctx.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+            ?: ctx.filesDir
         if (!dir.exists()) dir.mkdirs()
         val safeName = sanitizeFileName(fileName)
         val file = File(dir, safeName)
@@ -124,6 +136,8 @@ object DownloadUtil {
             FileOutputStream(file).use { out ->
                 out.write(bytes)
             }
+            // 明确告知真实落地位置，避免「提示成功但找不到文件」
+            Log.i(TAG, "saved to app-external dir: ${file.absolutePath}")
             file.absolutePath
         } catch (e: Exception) {
             Log.e(TAG, "save legacy failed", e)

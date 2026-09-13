@@ -13,48 +13,64 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.oldchat.material.OldChatApplication
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
 /**
- * 收藏 — favorites list (e.g. bookmarked moments / content).
- * Mirrors §7.4 (收藏). The original backs favorites from user's saved items;
- * here we show an empty-friendly list backed by a favorites fetch, with a
- * refresh action. When the server has no favorites endpoint defined in the
- * guide, we display a clean empty state rather than a dead button.
+ * 收藏 — §7.4 / routes.md。
+ *
+ * 服务端路由（routes.md:316-318）：
+ *   GET  /v1/favorites
+ *   POST /v1/favorites/add     { target_type, target_id }
+ *   POST /v1/favorites/remove  { target_type, target_id }
+ * ApiClient 的 base 已含 /v1，所以这里传 "/favorites"。
+ *
+ * BUG-01 修复：原先请求 /me/favorites（不存在 → 404），且解析里读 root["data"]，
+ * 而服务端实际返回的是 items，导致页面永远空白且错误被吞掉。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun FavoritesScreen(
     onBack: () -> Unit = {}
 ) {
+    val scope = rememberCoroutineScope()
+    val app = OldChatApplication.instance
+
     var items by remember { mutableStateOf<List<FavoriteItem>>(emptyList()) }
     var loading by remember { mutableStateOf(false) }
     var loaded by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
 
     suspend fun doLoad() {
         loading = true
-        // Try fetching favorites; fall back to empty list on any error.
+        error = null
         try {
-            OldChatApplication.instance.apiClient.get(
-                "/me/favorites"
-            ).fold(
+            app.apiClient.get("/favorites").fold(
                 onSuccess = { json ->
                     items = parseFavorites(json)
                     loaded = true
                 },
-                onFailure = {
-                    items = emptyList()
+                onFailure = { e ->
+                    // 不再静默吞掉：把失败原因显示出来，便于区分「真的没有收藏」和「接口失败」
+                    error = e.message ?: "加载失败"
                     loaded = true
                 }
             )
-        } catch (_: Exception) {
-            items = emptyList()
+        } catch (e: Exception) {
+            error = e.message ?: "加载失败"
             loaded = true
         } finally {
             loading = false
         }
+    }
+
+    suspend fun doRemove(item: FavoriteItem) {
+        val body = app.gson.toJson(
+            mapOf("target_type" to item.targetType, "target_id" to item.id)
+        )
+        app.apiClient.post("/favorites/remove", body).fold(
+            onSuccess = { items = items.filterNot { it.id == item.id && it.targetType == item.targetType } },
+            onFailure = { error = it.message ?: "取消收藏失败" }
+        )
     }
 
     LaunchedEffect(Unit) { doLoad() }
@@ -68,6 +84,11 @@ fun FavoritesScreen(
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回")
                     }
                 },
+                actions = {
+                    IconButton(onClick = { scope.launch { doLoad() } }, enabled = !loading) {
+                        Icon(Icons.Filled.Refresh, "刷新")
+                    }
+                },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.surface
                 )
@@ -78,6 +99,20 @@ fun FavoritesScreen(
             loading && !loaded -> {
                 Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
                     CircularProgressIndicator()
+                }
+            }
+            error != null && items.isEmpty() -> {
+                Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Icon(Icons.Filled.ErrorOutline, null, modifier = Modifier.size(56.dp),
+                            tint = MaterialTheme.colorScheme.error.copy(alpha = 0.6f))
+                        Spacer(Modifier.height(12.dp))
+                        Text("收藏加载失败", style = MaterialTheme.typography.bodyLarge)
+                        Text(error ?: "", style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Spacer(Modifier.height(8.dp))
+                        Button(onClick = { scope.launch { doLoad() } }) { Text("重试") }
+                    }
                 }
             }
             items.isEmpty() -> {
@@ -93,11 +128,7 @@ fun FavoritesScreen(
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f))
                         Spacer(Modifier.height(8.dp))
-                        TextButton(onClick = {
-                            CoroutineScope(Dispatchers.Main).launch { doLoad() }
-                        }) {
-                            Text("刷新")
-                        }
+                        TextButton(onClick = { scope.launch { doLoad() } }) { Text("刷新") }
                     }
                 }
             }
@@ -106,8 +137,11 @@ fun FavoritesScreen(
                     modifier = Modifier.fillMaxSize().padding(padding),
                     contentPadding = PaddingValues(vertical = 8.dp)
                 ) {
-                    items(items) { item ->
-                        FavoriteRow(item)
+                    items(items, key = { "${it.targetType}_${it.id}" }) { item ->   // BUG-19：补 key
+                        FavoriteRow(
+                            item = item,
+                            onRemove = { scope.launch { doRemove(item) } }
+                        )
                     }
                 }
             }
@@ -116,7 +150,7 @@ fun FavoritesScreen(
 }
 
 @Composable
-private fun FavoriteRow(item: FavoriteItem) {
+private fun FavoriteRow(item: FavoriteItem, onRemove: () -> Unit) {
     Card(
         modifier = Modifier
             .fillMaxWidth()
@@ -131,7 +165,7 @@ private fun FavoriteRow(item: FavoriteItem) {
         ) {
             Icon(Icons.Filled.Bookmark, null, tint = MaterialTheme.colorScheme.primary)
             Spacer(Modifier.width(12.dp))
-            Column {
+            Column(Modifier.weight(1f)) {
                 Text(item.title, style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.Medium)
                 if (item.subtitle.isNotEmpty()) {
@@ -139,29 +173,47 @@ private fun FavoriteRow(item: FavoriteItem) {
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
+            IconButton(onClick = onRemove) {
+                Icon(Icons.Filled.DeleteOutline, "取消收藏",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
         }
     }
 }
 
-private data class FavoriteItem(val id: String, val title: String, val subtitle: String = "")
+private data class FavoriteItem(
+    val id: String,
+    val targetType: String,
+    val title: String,
+    val subtitle: String = ""
+)
 
+/**
+ * 解析 GET /v1/favorites 的响应。
+ * 服务端字段为 items（不是 data），每条含 target_type / target_id；
+ * 兼容旧字段 item_type / item_id 与 id 形式，避免再次静默空白。
+ */
 private fun parseFavorites(json: String): List<FavoriteItem> {
     return try {
         val gson = OldChatApplication.instance.gson
         val trimmed = json.trim()
-        val list = if (trimmed.startsWith("[")) {
+        val list: List<*> = if (trimmed.startsWith("[")) {
             val type = object : com.google.gson.reflect.TypeToken<List<Map<String, Any>>>() {}.type
-            gson.fromJson<List<Map<String, Any>>>(trimmed, type) ?: emptyList()
+            gson.fromJson<List<Map<String, Any>>>(trimmed, type) ?: emptyList<Any>()
         } else {
             val root = gson.fromJson(trimmed, Map::class.java) as? Map<*, *>
-            (root?.get("data") as? List<*>)?.filterIsInstance<Map<*, *>>() ?: emptyList()
+            val raw = root?.get("items") ?: root?.get("data") ?: root?.get("list")
+            (raw as? List<*>) ?: emptyList<Any>()
         }
-        list.mapNotNull { m ->
-            val id = (m["id"] ?: m["fid"])?.toString() ?: return@mapNotNull null
+        list.filterIsInstance<Map<*, *>>().mapNotNull { m ->
+            val id = (m["target_id"] ?: m["item_id"] ?: m["id"] ?: m["fid"])?.toString()
+                ?: return@mapNotNull null
+            val type = (m["target_type"] ?: m["item_type"] ?: m["type"])?.toString() ?: "moment"
             FavoriteItem(
                 id = id,
-                title = (m["title"] ?: m["content"])?.toString() ?: "收藏",
-                subtitle = m["subtitle"]?.toString() ?: ""
+                targetType = type,
+                title = (m["title"] ?: m["content"] ?: m["preview"])?.toString() ?: "收藏",
+                subtitle = (m["subtitle"] ?: m["author_name"] ?: m["created_at"])?.toString() ?: ""
             )
         }
     } catch (_: Exception) { emptyList() }

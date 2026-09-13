@@ -1,6 +1,7 @@
 package com.oldchat.material.feature.chat
 
 import android.content.Context
+import android.util.Log
 import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -188,46 +189,68 @@ class GroupChatViewModel : ViewModel() {
 
     /**
      * Normal compensation: GET /groups/messages/after?group_id=&after_seq=&limit=100
+     *
+     * BUG-04 / ALIGN-03：规范 §4.2 的水位契约是
+     *   新水位 = 本页最大 group_seq（或服务端下发的 next_group_seq）
+     *   新锚点 = 就是那条 group_seq == 新水位的消息
+     * 原实现写成「水位 = 最大 seq + 1，锚点 = 本页里 seq == 水位 的消息」——
+     * 锚点构造上永远不存在（find 必然返回 null）→ 水位永不推进 →
+     * 下一次仍从同一个 after_seq 拉，has_more=true 时变成无限递归。
+     * 另外改成迭代 + 进度保护，杜绝递归爆栈与死循环。
      */
     private suspend fun pullAfter(afterSeq: Long) {
-        val result = apiClient.get(
-            "/groups/messages/after",
-            mapOf("group_id" to groupId, "after_seq" to afterSeq.toString(), "limit" to "100")
-        )
-        result.fold(
-            onSuccess = { body ->
-                val incoming = parseGroupMessages(body)
-                if (incoming.isEmpty()) return
+        var cursor = afterSeq
+        var rounds = 0
 
-                // Check server reset: server_group_seq < after_seq
-                val serverSeq = incoming.maxOfOrNull { it.groupSeq } ?: 0L
-                if (serverSeq < afterSeq) {
-                    cache.preferences.clearGroupSyncWatermark(groupId)
-                    watermarkSeq = 0
-                    pullLegacyUntilOverlap()
-                    return
-                }
+        while (rounds < MAX_PULL_ROUNDS) {
+            rounds++
 
-                mergeGroupMessages(incoming, appendToFront = false)
+            val result = apiClient.get(
+                "/groups/messages/after",
+                mapOf("group_id" to groupId, "after_seq" to cursor.toString(), "limit" to "100")
+            )
 
-                // Advance watermark: find anchor for next pull
-                val nextSeq = serverSeq + 1
-                val anchor = findAnchorForSeq(incoming, nextSeq)
-                if (nextSeq > afterSeq && anchor != null) {
-                    watermarkSeq = nextSeq
-                    watermarkAnchorId = anchor.id
-                    cache.preferences.saveGroupSyncWatermark(groupId, watermarkSeq, watermarkAnchorId)
-                }
-
-                // Check has_more
-                val hasMore = extractHasMore(body, incoming.size)
-                if (hasMore) pullAfter(watermarkSeq)
-            },
-            onFailure = {
-                // If after route returns 404, fallback to legacy
+            val body = result.getOrNull()
+            if (body == null) {
+                // 路由不可用（404 等）→ 回退 legacy 补拉
                 pullLegacyUntilOverlap()
+                return
             }
-        )
+
+            val incoming = parseGroupMessages(body)
+            if (incoming.isEmpty()) return
+
+            val serverSeq = incoming.maxOfOrNull { it.groupSeq } ?: 0L
+
+            // 服务端重置检测：整页都比本地水位旧 → 本地水位无效，清掉走 legacy
+            if (serverSeq < cursor) {
+                cache.preferences.clearGroupSyncWatermark(groupId)
+                watermarkSeq = 0
+                watermarkAnchorId = ""
+                pullLegacyUntilOverlap()
+                return
+            }
+
+            mergeGroupMessages(incoming, appendToFront = false)
+
+            // 新水位：优先用服务端 next_group_seq，否则用本页最大 seq
+            val nextSeq = extractLong(body, "next_group_seq")?.takeIf { it > 0L } ?: serverSeq
+            val anchor = findAnchorForSeq(incoming, nextSeq)
+
+            val noProgress = nextSeq <= cursor
+            if (!noProgress && anchor != null) {
+                cursor = nextSeq
+                watermarkSeq = nextSeq
+                watermarkAnchorId = anchor.id
+                cache.preferences.saveGroupSyncWatermark(groupId, watermarkSeq, watermarkAnchorId)
+            }
+
+            val hasMore = extractHasMore(body, incoming.size)
+            // 进度保护：服务端说还有更多、但水位没动（或拿不到锚点）时直接停，避免死循环
+            if (!hasMore || noProgress || anchor == null) return
+        }
+
+        Log.w(TAG, "pullAfter hit MAX_PULL_ROUNDS=$MAX_PULL_ROUNDS, stop at cursor=$cursor")
     }
 
     /**
@@ -309,6 +332,7 @@ class GroupChatViewModel : ViewModel() {
         } catch (_: Exception) { null }
     }
 
+    /** 锚点 = group_seq 正好等于水位的那个消息（BUG-04 修正后语义） */
     private fun findAnchorForSeq(messages: List<GroupMessage>, seq: Long): GroupMessage? {
         return messages.find { it.groupSeq == seq }
     }
@@ -327,7 +351,14 @@ class GroupChatViewModel : ViewModel() {
     private fun mergeGroupMessages(incoming: List<GroupMessage>, appendToFront: Boolean) {
         // 核心防御：只合并属于当前群的消息。任何来源（历史补全/WS/HTTP轮询/缓存）
         // 若 groupId 与当前群不一致就丢弃，杜绝「串群」。
-        val filtered = incoming.filter { it.groupId.isEmpty() || it.groupId == groupId }
+        // 加密通话的帧：控制帧丢弃；ENC 消息帧解出明文（虽然通话是单聊功能，
+        // 但同一套帧格式也可能出现在群消息里，统一处理避免显示成一串 base64）。
+        val callManager = OldChatApplication.instance.encryptedCallManager
+        val normalized = incoming.mapNotNull { m ->
+            val plain = callManager.unwrapForDisplay(m.body, m.fromUid) ?: return@mapNotNull null
+            if (plain == m.body) m else m.copy(body = plain)
+        }
+        val filtered = normalized.filter { it.groupId.isEmpty() || it.groupId == groupId }
         if (filtered.isEmpty()) return
 
         val current = _messages.value.toMutableList()
@@ -769,7 +800,13 @@ class GroupChatViewModel : ViewModel() {
         } catch (_: Exception) { null }
     }
 
-    companion object { const val MAX_WINDOW = 200 }
+    companion object {
+        const val MAX_WINDOW = 200
+
+        /** 单次补拉最多翻页轮数（BUG-04：防止服务端异常时无限翻页） */
+        private const val MAX_PULL_ROUNDS = 20
+        private const val TAG = "GroupChatViewModel"
+    }
 }
 
 /**

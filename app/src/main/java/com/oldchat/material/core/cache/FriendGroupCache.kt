@@ -85,7 +85,12 @@ class FriendCache(
         saveJob = saveScope.launch {
             delay(220)
             saveMutex.withLock {
-                val json = gson.toJson(friends.values.toList())
+                // ALIGN-10：好友缓存无上限，恶意/异常服务端可下发超大列表撑爆 SharedPreferences
+                val snapshot = friends.values.toList()
+                val bounded = if (snapshot.size > MAX_FRIENDS_PERSISTED) {
+                    snapshot.sortedByDescending { it.nickname }.take(MAX_FRIENDS_PERSISTED)
+                } else snapshot
+                val json = gson.toJson(bounded)
                 prefs.edit().putString(KEY_FRIENDS, json).apply()
             }
         }
@@ -95,6 +100,9 @@ class FriendCache(
 
     companion object {
         private const val KEY_FRIENDS = "friends"
+
+        /** ALIGN-10：本地落盘的好友条数上限（内存态不受限） */
+        private const val MAX_FRIENDS_PERSISTED = 1_000
     }
 }
 
@@ -160,7 +168,11 @@ class GroupCache(
         saveJob = saveScope.launch {
             delay(220)
             saveMutex.withLock {
-                val json = gson.toJson(groups.values.toList())
+                val snapshot = groups.values.toList()
+                val bounded = if (snapshot.size > MAX_GROUPS_PERSISTED) {
+                    snapshot.sortedByDescending { it.name }.take(MAX_GROUPS_PERSISTED)
+                } else snapshot
+                val json = gson.toJson(bounded)
                 prefs.edit().putString(KEY_GROUPS, json).apply()
             }
         }
@@ -170,5 +182,8 @@ class GroupCache(
 
     companion object {
         private const val KEY_GROUPS = "groups"
+
+        /** ALIGN-10：本地落盘的群条数上限 */
+        private const val MAX_GROUPS_PERSISTED = 500
     }
 }

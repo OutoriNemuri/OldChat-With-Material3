@@ -54,7 +54,13 @@ data class Message(
     @SerializedName("from_ncuid")
     val senderNcuid: String? = null,
     // Parsed payload (transient, not serialized to cache)
-    val cachedPayload: MessagePayload? = null
+    val cachedPayload: MessagePayload? = null,
+    /**
+     * 本地标记：该消息在传输时是加密通话的 ENC 帧（服务端不会下发本字段）。
+     * 仅用于界面提示与排查，缓存里存的始终是明文 body。
+     */
+    @SerializedName("is_encrypted_local")
+    val encrypted: Boolean = false
 ) {
     companion object {
         const val STATUS_NONE = 0
