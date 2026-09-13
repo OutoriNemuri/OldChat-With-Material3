@@ -1,10 +1,14 @@
-name: Android compile check
+name: Android build check
 
 # 目的：在没有 Android 构建环境的机器（iSH 上 JVM 因 getcpu ENOSYS 无法启动）上，
 # 借 GitHub 的 runner 做真实编译验证。
 #
 # 用法：手动触发（workflow_dispatch），或对 fix/** 分支与 PR 自动跑。
-# 只看 Kotlin 编译（不跑测试、不打 apk），最快拿到类型错误。
+# 三段验证：
+#   1. :app:compileDebugKotlin —— Kotlin 类型检查（最快拿到类型错误）
+#   2. :app:assembleDebug     —— 资源/AndroidManifest 打包（FileProvider、xml、drawable 等）
+#   3. :app:assembleRelease   —— R8 混淆 + 未签名 release（检验 proguard 规则收窄后的可用性）
+# 不跑单元测试/仪器测试。
 
 on:
   workflow_dispatch:
@@ -51,6 +55,16 @@ jobs:
         run: |
           chmod +x ./gradlew
           ./gradlew :app:compileDebugKotlin --no-daemon --stacktrace --console=plain
+
+      - name: Assemble debug APK (resources + manifest)
+        run: ./gradlew :app:assembleDebug --no-daemon --stacktrace --console=plain
+
+      - name: Assemble release APK (R8 / ProGuard rules)
+        run: ./gradlew :app:assembleRelease --no-daemon --stacktrace --console=plain
+
+      - name: Show APK outputs
+        if: success()
+        run: find app/build/outputs -name '*.apk' -exec ls -lh {} \;
 
       - name: Collect build reports on failure
         if: failure()
