@@ -440,6 +440,11 @@ class ChatViewModel : ViewModel() {
         var changed = false
 
         for (msg in incoming) {
+            // 加密通话的控制帧不属于「聊天消息」：历史回源（loadHistory / refreshLatest）与
+            // WS 推送共用这里，若不在此过滤，重新进入会话时会把 PQC_BEGIN/PQC_REPLY/ENC
+            // 当成气泡显示出来（WS 路径已在 onWsMessage 提前 return，这里是兜底）。
+            if (E2eFrame.isE2e(msg.body)) continue
+
             // 已存在消息（非本地临时消息）：更新 read/delivered 状态（已读回执实时刷新），
             // 而不是直接跳过。这样对方读取后，我们发出的消息能实时显示「已读」。
             if (messageIds.contains(msg.id)) {
