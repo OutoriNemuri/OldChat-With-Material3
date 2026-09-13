@@ -129,11 +129,23 @@ class EncryptedCallManager(
             )
             _systemText.value = "已使用本地共享密钥，无需握手"
             startTimers()
-            sendControl(peer, "start")
+            // 已有密钥时不需要握手，但仍要通知对端「通话开始」（ENC 控制帧）
+            scope.launch { sendControl(peer, "start") }
             return
         }
 
-        val pair = callKem.generateKeyPair()
+        // 每次拨号都重新挑一次 KEM（万一运行环境里 BC 缺失/异常，立刻降级而不是卡在「握手中」）
+        callKem = KemFactory.preferred()
+        var pair = callKem.generateKeyPair()
+        if (pair.publicKey.isEmpty()) {
+            // ML-KEM 反射路径失败 → 降级 ECDH P-256（帧格式不变，接收端按长度识别）
+            callKem = KemFactory.fallback()
+            pair = callKem.generateKeyPair()
+        }
+        if (pair.publicKey.isEmpty()) {
+            _state.value = CallState.Ended(peer, "本机加密模块不可用", System.currentTimeMillis())
+            return
+        }
         pendingPrivateKey = pair.privateKey
         _state.value = CallState.Establishing(peer, Role.INITIATOR, now, callKem.id)
         _systemText.value = "已发起加密通话，正在握手…"
@@ -363,6 +375,16 @@ class EncryptedCallManager(
         sendRaw(peer, E2eFrame.encode(E2eFrame.Kind.ENC, payload))
     }
 
+    /** 复位到可开始新通话的状态（保留 keyStore —— 密钥跨通话复用，与 enigmaj 一致） */
+    private fun reset() {
+        stopTimers()
+        pendingPrivateKey = null
+        sessionSecret = null
+        peerUid = null
+        _systemText.value = null
+        _state.value = CallState.Idle
+    }
+
     fun destroy() {
         stopTimers()
         pendingPrivateKey = null
@@ -381,6 +403,9 @@ object KemFactory {
     private val ecdh by lazy { EcdhP256Kem() }
 
     fun preferred(): E2eKem = if (mlKem.available) mlKem else ecdh
+
+    /** 强制降级实现（ML-KEM 不可用或运行期失败时使用） */
+    fun fallback(): E2eKem = ecdh
 
     /** 接收端按公钥长度自动识别对端 KEM（1184 → ML-KEM-768，其余 → P-256） */
     fun forPublicKeySize(size: Int): E2eKem =

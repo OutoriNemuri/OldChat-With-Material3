@@ -137,6 +137,7 @@ class WebSocketManager(
         scope.launch { _directMessages.emit(message) }
         // BUG-09 / ALIGN-06：轮询拉到的消息同样要出通知
         runCatching { NotificationHelper.notifyDirect(message) }
+        routeE2eFrame(message.body, message.fromUid)
     }
 
     /**
@@ -282,6 +283,24 @@ class WebSocketManager(
         return if (sessionId != null) "$url&sid=$sessionId" else url
     }
 
+    /**
+     * 加密通话的控制帧（PQC_BEGIN / PQC_REPLY / ENC）在这里**统一消费**。
+     *
+     * 放在网络层的原因：呼叫必须在任何界面下都能被接起 —— 若挂在 ChatViewModel
+     * （只在打开该会话时存在），对方不在会话页就永远接不到来电。
+     * 所有入站直聊消息（WS 推送与 HTTP 轮询注入）都经过这个方法。
+     */
+    private fun routeE2eFrame(body: String, fromUid: String) {
+        if (!com.oldchat.material.core.e2e.E2eFrame.isE2e(body)) return
+        val myUid = authManager.myUid
+        // 自己发出的帧会被回显，不能当成对方来电
+        if (myUid != null && fromUid == myUid) return
+        runCatching {
+            com.oldchat.material.OldChatApplication.instance.encryptedCallManager
+                .handleIncoming(body, fromUid)
+        }
+    }
+
     /** BUG-14：把 URL / 字符串里的 token、sid 打码后再进日志。 */
     private fun maskSecrets(raw: String): String =
         raw.replace(Regex("token=[^&\\s]+")) { "token=***" }
@@ -410,6 +429,7 @@ class WebSocketManager(
                         scope.launch { _directMessages.emit(message) }
                         // BUG-09 / ALIGN-06：新消息系统通知
                         runCatching { NotificationHelper.notifyDirect(message) }
+                        routeE2eFrame(message.body, message.fromUid)
                     }
                 }
                 // ---- 群消息 ----

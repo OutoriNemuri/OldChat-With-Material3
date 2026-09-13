@@ -956,14 +956,10 @@ class ChatViewModel : ViewModel() {
         // 加密通话的控制帧（PQC_BEGIN / PQC_REPLY / ENC）交给通话层消费：
         // 它们不该出现在聊天气泡里，也不该写进消息缓存。
         // 收到 PQC_BEGIN 时通话层会自动回 PQC_REPLY（与 enigmaj 的响应方行为一致）。
-        // 注意：自己发出的帧会被服务端回显（fromUid == 自己），必须排除，
-        // 否则会把自己的 PQC_BEGIN 当成对方的呼叫、回自己一个 PQC_REPLY。
-        if (myUid != null && message.fromUid != myUid &&
-            E2eFrame.isE2e(message.body) &&
-            callManager.handleIncoming(message.body, message.fromUid)
-        ) {
-            return
-        }
+        // 加密通话的控制帧不展示为聊天气泡、也不写入消息缓存。
+        // 帧的**处理**统一在 WebSocketManager.routeE2eFrame（网络层单点），
+        // 这样对方不在会话页时也能接起来电；这里只负责过滤。
+        if (E2eFrame.isE2e(message.body)) return
 
         // ALIGN-02：收到本会话实时消息 → 合并触发一次回执刷新（替代 5s 轮询）
         triggerReceiptRefresh()
