@@ -16,8 +16,8 @@ android {
         applicationId = "com.oldchat.material"
         minSdk = 24
         targetSdk = 35
-        versionCode = 3012
-        versionName = "2.3.4 (build 1)"
+        versionCode = 3014
+        versionName = "2.4.0 (build 1)"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {

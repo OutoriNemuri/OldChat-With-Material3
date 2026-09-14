@@ -46,6 +46,33 @@ class HomeViewModel : ViewModel() {
     private val _friendRequestCount = MutableStateFlow(0)
     val friendRequestCount: StateFlow<Int> = _friendRequestCount.asStateFlow()
 
+    // ---- 构造期就要用到的字段必须声明在最上面（见下方 init）----
+    // 说明：ALIGN-01/ALIGN-12 的 previewFetched / previewGate / recentChatsRefresh
+    // 会被 init → loadCache() / refreshFriends() 直接用到；若声明在使用点之后，
+    // 构造期读到的是 null，会抛
+    //   NullPointerException: Flow.collect(...) on a null object reference
+    // （线上崩溃即由此产生，故统一前移到 init 之前）。
+
+    // ---- ALIGN-01：会话列表预览的「反滥用」闸门 ----
+    // 规范 §0：不允许朴素全量刷新（每个会话都回源一次历史）——会被监测/限流/封禁。
+    // §7.1：lastMessage 优先用服务端随列表下发的字段与本地缓存，只有确实没有预览时
+    // 才回源，且并发受限、每个会话最多补一次。
+    private val previewFetched: MutableSet<String> =
+        java.util.Collections.synchronizedSet(mutableSetOf<String>())
+    private val previewGate = kotlinx.coroutines.sync.Semaphore(4)
+
+    // ALIGN-12：会话列表刷新的 220ms 合并窗口。
+    // 原实现每收到一条 WS 消息就重排/重发一次列表状态 —— 消息成串到达时
+    // Compose 会连续重组 N 次。这里统一走这个触发器，合并成一次。
+    private val recentChatsRefresh = MutableSharedFlow<Unit>(
+        extraBufferCapacity = 32,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+
+    private fun requestRecentChatsRefresh() {
+        recentChatsRefresh.tryEmit(Unit)
+    }
+
     init {
         loadCache()
         observeWebSocket()
@@ -166,25 +193,8 @@ class HomeViewModel : ViewModel() {
         }
     }
 
-    // ---- ALIGN-01：会话列表预览的「反滥用」闸门 ----
-    // 规范 §0：不允许朴素全量刷新（每个会话都回源一次历史）——会被监测/限流/封禁。
-    // §7.1：lastMessage 优先用服务端随列表下发的字段与本地缓存，只有确实没有预览时
-    // 才回源，且并发受限、每个会话最多补一次。
-    private val previewFetched: MutableSet<String> =
-        java.util.Collections.synchronizedSet(mutableSetOf<String>())
-    private val previewGate = kotlinx.coroutines.sync.Semaphore(4)
-
-    // ALIGN-12：会话列表刷新的 220ms 合并窗口。
-    // 原实现每收到一条 WS 消息就重排/重发一次列表状态 —— 消息成串到达时
-    // Compose 会连续重组 N 次。这里统一走这个触发器，合并成一次。
-    private val recentChatsRefresh = MutableSharedFlow<Unit>(
-        extraBufferCapacity = 32,
-        onBufferOverflow = BufferOverflow.DROP_OLDEST
-    )
-
-    private fun requestRecentChatsRefresh() {
-        recentChatsRefresh.tryEmit(Unit)
-    }
+    // （ALIGN-01 的 previewFetched / previewGate 与 ALIGN-12 的 recentChatsRefresh
+    //   已前移到 init 之前声明，见文件上方。）
 
     /**
      * 服务端随 /friends、/groups 下发的 last_message 解析结果：
