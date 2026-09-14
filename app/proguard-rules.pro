@@ -28,7 +28,13 @@
 -keep class io.ktor.client.engine.okhttp.** { *; }
 
 # ---- SpongyCastle (if used for ECDH) ----
--keep class org.spongycastle.** { *; }
+# ---- BouncyCastle：ML-KEM-768（加密通话）----
+# ML-KEM 在 org.bouncycastle.crypto.{params,generators,kems} 下；虽然现在是**直接引用**
+# （R8 能看到引用），仍显式 keep 以免将来改动/反射探测把它裁掉导致静默降级。
+-keep class org.bouncycastle.crypto.kems.** { *; }
+-keep class org.bouncycastle.crypto.generators.MLKEMKeyPairGenerator { *; }
+-keep class org.bouncycastle.crypto.params.MLKEM** { *; }
+-dontwarn org.bouncycastle.**
 
 # ---- Media3 ----
 -keep class androidx.media3.exoplayer.** { *; }

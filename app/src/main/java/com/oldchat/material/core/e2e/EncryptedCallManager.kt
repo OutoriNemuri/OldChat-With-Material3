@@ -124,7 +124,23 @@ class EncryptedCallManager(
      * （"已使用提供的共享密钥，无需握手"）并额外发一帧 `ENC` 控制帧通知对方开始，
      * 否则发 `PQC_BEGIN` 走完整握手（每次通话都是新的临时密钥，具备前向保密）。
      */
-    fun start(peer: String) {
+    /**
+     * 拨号时由用户选择的「用哪条连接」（界面每次点击「加密通话」都会问一次）。
+     */
+    enum class KemMode(val label: String, val hint: String) {
+        REUSE("复用", "用本地已保存的共享密钥，不做握手（最快，密钥不轮换）"),
+        AUTO("自动", "优先 ML-KEM-768，本机不可用时自动降级 ECDH P-256"),
+        MLKEM768("新 ML-KEM", "强制新握手，ML-KEM-768（FIPS 203）"),
+        ECDH_P256("新 P-256", "强制新握手，ECDH P-256 + SHA-256（兼容性最好）")
+    }
+
+    /** 本地是否已有该对端的共享密钥（决定「复用」这一项是否可用） */
+    fun hasStoredKey(peer: String): Boolean = keyStore.get(peer)?.size == 32
+
+    /** 本机 ML-KEM-768 是否可用（决定「新 ML-KEM」这一项是否可用） */
+    fun isMlKemAvailable(): Boolean = KemFactory.mlKemOrNull() != null
+
+    fun start(peer: String, mode: KemMode = KemMode.AUTO) {
         if (peer.isBlank()) return
         val current = _state.value
         if (current is CallState.Connected && current.peer == peer) return
@@ -134,39 +150,73 @@ class EncryptedCallManager(
         lastFrameAt = System.currentTimeMillis()
         val now = System.currentTimeMillis()
 
-        val stored = keyStore.get(peer)
-        if (stored != null && stored.size == 32) {
-            sessionSecret = stored
-            _state.value = CallState.Connected(
-                peer = peer,
-                role = Role.INITIATOR,
-                startedAt = now,
-                kem = callKem.id,
-                fingerprint = E2eFingerprint.of(stored),
-                persisted = true
+        when (mode) {
+            // ---- 复用本地密钥：不握手，直接进入通话并通知对端 ----
+            KemMode.REUSE -> {
+                val stored = keyStore.get(peer)
+                if (stored == null || stored.size != 32) {
+                    _systemText.value = "本地没有 $peer 的共享密钥，已改用自动模式"
+                    startHandshake(peer, now, KemFactory.preferred(), allowFallback = true)
+                    return
+                }
+                callKem = KemFactory.preferred()
+                sessionSecret = stored
+                _state.value = CallState.Connected(
+                    peer = peer,
+                    role = Role.INITIATOR,
+                    startedAt = now,
+                    kem = callKem.id,
+                    fingerprint = E2eFingerprint.of(stored),
+                    persisted = true
+                )
+                _systemText.value = "已复用本地共享密钥，无需握手"
+                startTimers()
+                scope.launch { sendControl(peer, "start") }
+            }
+
+            // ---- 强制 ML-KEM-768：不可用就明确失败，不静默降级 ----
+            KemMode.MLKEM768 -> {
+                val kem = KemFactory.mlKemOrNull()
+                if (kem == null) {
+                    _state.value = CallState.Ended(
+                        peer, "本机 ML-KEM-768 不可用（BouncyCastle 未就绪）", now
+                    )
+                    _systemText.value = "ML-KEM-768 不可用"
+                    return
+                }
+                startHandshake(peer, now, kem, allowFallback = false)
+            }
+
+            // ---- 强制 ECDH P-256 ----
+            KemMode.ECDH_P256 -> startHandshake(peer, now, KemFactory.ecdh(), allowFallback = false)
+
+            // ---- 自动：优先 ML-KEM，失败才降级 ----
+            KemMode.AUTO -> startHandshake(peer, now, KemFactory.preferred(), allowFallback = true)
+        }
+    }
+
+    /**
+     * 发起一次新握手（PQC_BEGIN）。
+     * @param allowFallback 仅 AUTO 模式为 true：ML-KEM 生成密钥失败时降级 ECDH P-256。
+     */
+    private fun startHandshake(peer: String, now: Long, kem: E2eKem, allowFallback: Boolean) {
+        var chosen = kem
+        var pair = chosen.generateKeyPair()
+        if (pair.publicKey.isEmpty() && allowFallback && chosen !== KemFactory.ecdh()) {
+            chosen = KemFactory.ecdh()
+            pair = chosen.generateKeyPair()
+        }
+        if (pair.publicKey.isEmpty()) {
+            _state.value = CallState.Ended(
+                peer, "本机加密模块不可用（${chosen.id}）", System.currentTimeMillis()
             )
-            _systemText.value = "已使用本地共享密钥，无需握手"
-            startTimers()
-            // 已有密钥时不需要握手，但仍要通知对端「通话开始」（ENC 控制帧）
-            scope.launch { sendControl(peer, "start") }
             return
         }
 
-        // 每次拨号都重新挑一次 KEM（万一运行环境里 BC 缺失/异常，立刻降级而不是卡在「握手中」）
-        callKem = KemFactory.preferred()
-        var pair = callKem.generateKeyPair()
-        if (pair.publicKey.isEmpty()) {
-            // ML-KEM 反射路径失败 → 降级 ECDH P-256（帧格式不变，接收端按长度识别）
-            callKem = KemFactory.fallback()
-            pair = callKem.generateKeyPair()
-        }
-        if (pair.publicKey.isEmpty()) {
-            _state.value = CallState.Ended(peer, "本机加密模块不可用", System.currentTimeMillis())
-            return
-        }
+        callKem = chosen
         pendingPrivateKey = pair.privateKey
-        _state.value = CallState.Establishing(peer, Role.INITIATOR, now, callKem.id)
-        _systemText.value = "已发起加密通话，正在握手…"
+        _state.value = CallState.Establishing(peer, Role.INITIATOR, now, chosen.id)
+        _systemText.value = "已发起加密通话（${chosen.id}），正在握手…"
 
         // 对端离线/未响应时不能永远停在「握手中」——超时即结束（对称：两端行为一致）
         handshakeJob?.cancel()
@@ -491,16 +541,23 @@ class EncryptedCallManager(
 /** 按可用性挑选 KEM：优先 ML-KEM-768（与 enigmaj 同算法），否则降级 ECDH P-256。 */
 object KemFactory {
     private val mlKem by lazy { MlKem768Kem() }
-    private val ecdh by lazy { EcdhP256Kem() }
+    private val ecdhKem by lazy { EcdhP256Kem() }
 
-    fun preferred(): E2eKem = if (mlKem.available) mlKem else ecdh
+    /** 自动模式：有 ML-KEM 就用，否则 P-256 */
+    fun preferred(): E2eKem = if (mlKem.available) mlKem else ecdhKem
 
-    /** 强制降级实现（ML-KEM 不可用或运行期失败时使用） */
-    fun fallback(): E2eKem = ecdh
+    /** ECDH P-256 实现（总是可用）——「新 P-256」模式与降级路径都用它 */
+    fun ecdh(): E2eKem = ecdhKem
+
+    /** ML-KEM-768 实现；不可用时返回 null（「新 ML-KEM」模式据此明确失败而不是静默降级） */
+    fun mlKemOrNull(): E2eKem? = if (mlKem.available) mlKem else null
+
+    /** 降级实现（AUTO 模式下 ML-KEM 生成密钥失败时使用） */
+    fun fallback(): E2eKem = ecdhKem
 
     /** 接收端按公钥长度自动识别对端 KEM（1184 → ML-KEM-768，其余 → P-256） */
     fun forPublicKeySize(size: Int): E2eKem =
-        if (mlKem.available && size >= MLKEM_768_PUBLIC_KEY_SIZE - 8) mlKem else ecdh
+        if (mlKem.available && size >= MLKEM_768_PUBLIC_KEY_SIZE - 8) mlKem else ecdhKem
 
     /** ML-KEM-768 封装公钥固定 1184 B（enigmaj 实测：base64 后 1580 字符） */
     private const val MLKEM_768_PUBLIC_KEY_SIZE = 1184

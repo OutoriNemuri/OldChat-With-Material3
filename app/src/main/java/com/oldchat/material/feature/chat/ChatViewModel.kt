@@ -987,10 +987,19 @@ class ChatViewModel : ViewModel() {
     val callSystemText = app.encryptedCallManager.systemText
 
     /** 拨出/挂断都由界面调用；第二次点击 = 挂断（界面负责先弹确认） */
-    fun startEncryptedCall() {
+    fun startEncryptedCall(mode: EncryptedCallManager.KemMode) {
         if (friendUid.isBlank()) return
-        callManager.start(friendUid)
+        callManager.start(friendUid, mode)
     }
+
+    /** 兼容旧调用（未指定模式 = 自动） */
+    fun startEncryptedCall() = startEncryptedCall(EncryptedCallManager.KemMode.AUTO)
+
+    /** 界面用：本地是否已有该对端密钥（决定「复用」是否可用） */
+    fun hasStoredCallKey(): Boolean = callManager.hasStoredKey(friendUid)
+
+    /** 界面用：本机 ML-KEM-768 是否可用（决定「新 ML-KEM」是否可用） */
+    fun isMlKemAvailable(): Boolean = callManager.isMlKemAvailable()
 
     fun hangUpEncryptedCall() {
         callManager.hangUp()

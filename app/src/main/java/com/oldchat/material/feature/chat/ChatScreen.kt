@@ -75,6 +75,8 @@ fun ChatScreen(
     var callOverlayVisible by remember { mutableStateOf(false) }
     // 挂断确认框状态：必须在下面的通话页分支之前声明（Kotlin 局部变量按声明顺序可见）
     var showHangUpConfirm by remember { mutableStateOf(false) }
+    // 拨号方式选择框（复用 / 自动 / 新 ML-KEM / 新 P-256）
+    var showCallModeDialog by remember { mutableStateOf(false) }
     LaunchedEffect(callActive) {
         // 通话开始 → 自动展开；通话结束 → 收起
         callOverlayVisible = callActive
@@ -430,6 +432,19 @@ fun ChatScreen(
         )
     }
 
+    // 拨号方式选择：每次点击「加密通话」都会问一次
+    if (showCallModeDialog) {
+        CallModeDialog(
+            hasStoredKey = chatViewModel.hasStoredCallKey(),
+            mlKemAvailable = chatViewModel.isMlKemAvailable(),
+            onPick = { mode ->
+                showCallModeDialog = false
+                chatViewModel.startEncryptedCall(mode)
+            },
+            onDismiss = { showCallModeDialog = false }
+        )
+    }
+
     if (showRedPacketDialog) {
         RedPacketComposerDialog(
             onDismiss = { showRedPacketDialog = false },
@@ -513,7 +528,8 @@ fun ChatScreen(
                                     // 再次点击 = 退出，但必须先确认
                                     showHangUpConfirm = true
                                 } else {
-                                    chatViewModel.startEncryptedCall()
+                                    // 每次拨号都先问「用哪条连接」
+                                    showCallModeDialog = true
                                 }
                             },
                             modifier = Modifier.size(56.dp),
@@ -1764,6 +1780,68 @@ private fun HangUpConfirmDialog(
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("继续通话") }
+        }
+    )
+}
+
+/**
+ * 拨号方式选择框：每次点击「加密通话」都会问一次，决定这条连接怎么建。
+ *
+ * 四项与 [EncryptedCallManager.KemMode] 一一对应；不可用的项会置灰并说明原因
+ * （本地无密钥 → 「复用」不可用；BouncyCastle 未就绪 → 「新 ML-KEM」不可用）。
+ */
+@Composable
+private fun CallModeDialog(
+    hasStoredKey: Boolean,
+    mlKemAvailable: Boolean,
+    onPick: (EncryptedCallManager.KemMode) -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("加密通话连接方式") },
+        text = {
+            Column {
+                EncryptedCallManager.KemMode.entries.forEach { mode ->
+                    val enabled = when (mode) {
+                        EncryptedCallManager.KemMode.REUSE -> hasStoredKey
+                        EncryptedCallManager.KemMode.MLKEM768 -> mlKemAvailable
+                        else -> true
+                    }
+                    val note = when {
+                        enabled -> mode.hint
+                        mode == EncryptedCallManager.KemMode.REUSE -> "本地尚未保存与该联系人的共享密钥"
+                        else -> "本机 BouncyCastle 未就绪，ML-KEM 不可用"
+                    }
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable(enabled = enabled) { onPick(mode) }
+                            .padding(vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(selected = false, onClick = if (enabled) ({ onPick(mode) }) else null,
+                            enabled = enabled)
+                        Spacer(Modifier.width(6.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                mode.label,
+                                style = MaterialTheme.typography.titleSmall,
+                                color = if (enabled) MaterialTheme.colorScheme.onSurface
+                                        else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                            )
+                            Text(
+                                note,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
         }
     )
 }

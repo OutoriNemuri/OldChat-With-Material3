@@ -1,6 +1,14 @@
 package com.oldchat.material.core.e2e
 
 import android.util.Base64
+import android.util.Log
+import org.bouncycastle.crypto.generators.MLKEMKeyPairGenerator
+import org.bouncycastle.crypto.kems.MLKEMExtractor
+import org.bouncycastle.crypto.kems.MLKEMGenerator
+import org.bouncycastle.crypto.params.MLKEMKeyGenerationParameters
+import org.bouncycastle.crypto.params.MLKEMParameters
+import org.bouncycastle.crypto.params.MLKEMPrivateKeyParameters
+import org.bouncycastle.crypto.params.MLKEMPublicKeyParameters
 import java.security.KeyFactory
 import java.security.KeyPairGenerator
 import java.security.MessageDigest
@@ -82,11 +90,19 @@ data class E2eEncapsulation(val ciphertext: ByteArray, val sharedSecret: ByteArr
 /**
  * ML-KEM-768（FIPS 203），与 enigmaj 完全一致的 KEM。
  *
- * Android 没有内置 ML-KEM，这里用 BouncyCastle 的 `bcprov-jdk18on`（1.78+ 起提供
- * `org.bouncycastle.pqc.crypto.mlkem.*`）。为避免「依赖/类名/构造参数顺序差异」导致
- * **编译**失败，全部通过反射调用：
- *   - 类不存在 → [available] 为 false → 上层自动降级到 [EcdhP256Kem]；
- *   - 构造顺序不匹配 → 按参数个数 + 可赋值性自动挑选匹配的构造器。
+ * Android 没有内置 ML-KEM，这里用 BouncyCastle `bcprov-jdk18on`。
+ *
+ * ⚠️ 关键事实（2026-09-14 用 class 文件解析核对，网上说法有误）：
+ *   - **1.78.1 里没有 ML-KEM**，只有老的 `pqc.crypto.crystals.kyber`（经典 Kyber，非 FIPS 203）；
+ *   - 有 ML-KEM 的版本里，它**不在** `org.bouncycastle.pqc.crypto.mlkem` 下，而是：
+ *       org.bouncycastle.crypto.params.MLKEMParameters        （静态字段 ml_kem_512/768/1024）
+ *       org.bouncycastle.crypto.params.MLKEMKeyGenerationParameters(SecureRandom, MLKEMParameters)
+ *       org.bouncycastle.crypto.generators.MLKEMKeyPairGenerator（init(KeyGenerationParameters) / generateKeyPair()）
+ *       org.bouncycastle.crypto.kems.MLKEMGenerator(SecureRandom).generateEncapsulated(AsymmetricKeyParameter)
+ *       org.bouncycastle.crypto.kems.MLKEMExtractor(MLKEMPrivateKeyParameters).extractSecret(byte[])
+ *     → 因此依赖已升到 **1.86**，这里改为**直接引用**（编译期校验 + R8 可见，不再靠反射）。
+ *
+ * 仍保留 [available] 探测：万一依赖被裁掉/移除，上层会自动降级 ECDH P-256，而不是崩。
  * 帧格式与 SS 长度与 enigmaj 完全一致（ek 1184 B、ct 1088 B、SS 32 B）。
  */
 class MlKem768Kem : E2eKem {
@@ -94,120 +110,63 @@ class MlKem768Kem : E2eKem {
     override val id = "ML-KEM-768"
     override val publicKeySize = 1184
 
-    private class Refs(
-        val params: Class<*>,
-        val kpg: Class<*>,
-        val kgp: Class<*>,
-        val gen: Class<*>,
-        val ext: Class<*>,
-        val pub: Class<*>,
-        val priv: Class<*>,
-        val asymmetricKeyParameter: Class<*>
-    )
-
-    private val refs: Refs? = runCatching {
-        Refs(
-            params = Class.forName("org.bouncycastle.pqc.crypto.mlkem.MLKEMParameters"),
-            kpg = Class.forName("org.bouncycastle.pqc.crypto.mlkem.MLKEMKeyPairGenerator"),
-            kgp = Class.forName("org.bouncycastle.pqc.crypto.mlkem.MLKEMKeyGenerationParameters"),
-            gen = Class.forName("org.bouncycastle.pqc.crypto.mlkem.MLKEMGenerator"),
-            ext = Class.forName("org.bouncycastle.pqc.crypto.mlkem.MLKEMExtractor"),
-            pub = Class.forName("org.bouncycastle.pqc.crypto.mlkem.MLKEMPublicKeyParameters"),
-            priv = Class.forName("org.bouncycastle.pqc.crypto.mlkem.MLKEMPrivateKeyParameters"),
-            asymmetricKeyParameter = Class.forName("org.bouncycastle.crypto.params.AsymmetricKeyParameter")
-        )
-    }.getOrNull()
-
-    /** BouncyCastle 的 ML-KEM 是否可用（不可用时上层降级 ECDH P-256） */
-    val available: Boolean get() = refs != null
-
-    private fun params768(): Any? = runCatching {
-        refs!!.params.getField("ml_kem_768").get(null)
-    }.getOrNull()
+    /**
+     * 依赖是否可用（BC 被移除/被裁掉时上层降级）。用类探测而不是直接 try：
+     * 直接引用只在这几个方法里出现，探测失败时不会走到它们，因此不会 NoClassDefFoundError。
+     */
+    val available: Boolean = runCatching {
+        Class.forName("org.bouncycastle.crypto.params.MLKEMParameters")
+        Class.forName("org.bouncycastle.crypto.generators.MLKEMKeyPairGenerator")
+        Class.forName("org.bouncycastle.crypto.kems.MLKEMGenerator")
+        Class.forName("org.bouncycastle.crypto.kems.MLKEMExtractor")
+        true
+    }.getOrElse { e ->
+        Log.w(TAG, "BouncyCastle ML-KEM 不可用，将降级 ECDH P-256：${e.javaClass.simpleName} ${e.message}")
+        false
+    }
 
     override fun generateKeyPair(): E2eKeyPair {
-        val r = refs ?: return E2eKeyPair(ByteArray(0), ByteArray(0))
-        val params = params768() ?: return E2eKeyPair(ByteArray(0), ByteArray(0))
-
-        val kpg = construct(r.kpg) ?: return E2eKeyPair(ByteArray(0), ByteArray(0))
-        val kgp = construct(r.kgp, SecureRandom(), params)
-            ?: construct(r.kgp, params, SecureRandom())
-            ?: return E2eKeyPair(ByteArray(0), ByteArray(0))
-        invoke(kpg, "init", kgp) ?: return E2eKeyPair(ByteArray(0), ByteArray(0))
-
-        val pair = invoke(kpg, "generateKeyPair") ?: return E2eKeyPair(ByteArray(0), ByteArray(0))
-        val pub = invoke(pair, "getPublic") ?: return E2eKeyPair(ByteArray(0), ByteArray(0))
-        val priv = invoke(pair, "getPrivate") ?: return E2eKeyPair(ByteArray(0), ByteArray(0))
-        val pubBytes = (invoke(pub, "getEncoded") as? ByteArray)
-            ?: return E2eKeyPair(ByteArray(0), ByteArray(0))
-        val privBytes = (invoke(priv, "getEncoded") as? ByteArray)
-            ?: return E2eKeyPair(ByteArray(0), ByteArray(0))
-        return E2eKeyPair(pubBytes, privBytes)
+        if (!available) return E2eKeyPair(ByteArray(0), ByteArray(0))
+        return runCatching {
+            val kpg = MLKEMKeyPairGenerator()
+            kpg.init(MLKEMKeyGenerationParameters(SecureRandom(), MLKEMParameters.ml_kem_768))
+            val pair = kpg.generateKeyPair()
+            E2eKeyPair(
+                (pair.getPublic() as MLKEMPublicKeyParameters).encoded,
+                (pair.getPrivate() as MLKEMPrivateKeyParameters).encoded
+            )
+        }.getOrElse { e ->
+            Log.e(TAG, "ML-KEM 生成密钥对失败", e)
+            E2eKeyPair(ByteArray(0), ByteArray(0))
+        }
     }
 
     override fun encapsulate(peerPublicKey: ByteArray): E2eEncapsulation? {
-        val r = refs ?: return null
-        val params = params768() ?: return null
-        val peerPub = construct(r.pub, params, peerPublicKey) ?: return null
-        val generator = construct(r.gen, SecureRandom()) ?: return null
-        val encapsulated = invokeTyped(generator, "generateEncapsulated", r.asymmetricKeyParameter, peerPub)
-            ?: return null
-        val ct = invoke(encapsulated, "getEncapsulation") as? ByteArray ?: return null
-        val ss = invoke(encapsulated, "getSecret") as? ByteArray ?: return null
-        return E2eEncapsulation(ct, ss)
+        if (!available) return null
+        return runCatching {
+            val peerPub = MLKEMPublicKeyParameters(MLKEMParameters.ml_kem_768, peerPublicKey)
+            val encapsulated = MLKEMGenerator(SecureRandom()).generateEncapsulated(peerPub)
+            E2eEncapsulation(encapsulated.encapsulation, encapsulated.secret)
+        }.getOrElse { e ->
+            Log.w(TAG, "ML-KEM 封装失败（对端公钥可能不是 ML-KEM-768 格式）", e)
+            null
+        }
     }
 
     override fun decapsulate(ciphertext: ByteArray, privateKey: ByteArray): ByteArray? {
-        val r = refs ?: return null
-        val params = params768() ?: return null
-        val priv = construct(r.priv, params, privateKey) ?: return null
-        val extractor = construct(r.ext, priv) ?: return null
-        return invokeTyped(extractor, "extractSecret", ByteArray::class.java, ciphertext) as? ByteArray
-    }
-
-    // ---- 反射小工具（容错：不依赖构造参数顺序、不依赖方法重载签名） ----
-
-    private fun construct(cls: Class<*>, vararg args: Any): Any? {
-        for (ctor in cls.constructors) {
-            if (ctor.parameterCount != args.size) continue
-            val types = ctor.parameterTypes
-            var ok = true
-            for (i in args.indices) {
-                val t = types[i]
-                val a = args[i]
-                val assignable = t.isInstance(a) ||
-                    (t.isPrimitive && (
-                        (t == Int::class.javaPrimitiveType && a is Int) ||
-                            (t == Long::class.javaPrimitiveType && a is Long) ||
-                            (t == Boolean::class.javaPrimitiveType && a is Boolean)
-                        ))
-                if (!assignable) { ok = false; break }
-            }
-            if (!ok) continue
-            runCatching { return ctor.newInstance(*args) }
+        if (!available) return null
+        return runCatching {
+            val priv = MLKEMPrivateKeyParameters(MLKEMParameters.ml_kem_768, privateKey)
+            MLKEMExtractor(priv).extractSecret(ciphertext)
+        }.getOrElse { e ->
+            Log.w(TAG, "ML-KEM 解封装失败", e)
+            null
         }
-        return null
     }
 
-    private fun invoke(target: Any, name: String): Any? =
-        runCatching {
-            target.javaClass.methods.firstOrNull { it.name == name && it.parameterCount == 0 }
-                ?.invoke(target)
-        }.getOrNull()
-
-    private fun invoke(target: Any, name: String, arg: Any): Any? =
-        runCatching {
-            target.javaClass.methods.firstOrNull {
-                it.name == name && it.parameterCount == 1 && it.parameterTypes[0].isInstance(arg)
-            }?.invoke(target, arg)
-        }.getOrNull()
-
-    private fun invokeTyped(target: Any, name: String, type: Class<*>, arg: Any): Any? =
-        runCatching {
-            target.javaClass.methods.firstOrNull {
-                it.name == name && it.parameterCount == 1 && it.parameterTypes[0].isAssignableFrom(type)
-            }?.invoke(target, arg)
-        }.getOrNull()
+    companion object {
+        private const val TAG = "MlKem768Kem"
+    }
 }
 
 /**

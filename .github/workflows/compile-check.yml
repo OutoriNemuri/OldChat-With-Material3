@@ -62,6 +62,17 @@ jobs:
       - name: Assemble release APK (R8 / ProGuard rules)
         run: ./gradlew :app:assembleRelease --no-daemon --stacktrace --console=plain
 
+      # 用真 JVM 跑一遍 BC 的 ML-KEM-768：验证 API 可用 + 长度与 enigmaj 抓包一致。
+      # 这一步是「加密通话为什么会静默降级 P-256」的回归测试（详见 tools/kem_check/KemCheck.java）。
+      - name: Verify BouncyCastle ML-KEM-768 API
+        run: |
+          JAR=$(find ~/.gradle/caches -name 'bcprov-jdk18on-*.jar' | head -1)
+          echo "BC jar: $JAR"
+          test -n "$JAR" || { echo "未找到 bcprov jar"; exit 1; }
+          mkdir -p /tmp/kemcheck
+          javac -cp "$JAR" -d /tmp/kemcheck tools/kem_check/KemCheck.java
+          java -cp "$JAR:/tmp/kemcheck" KemCheck
+
       - name: Show APK outputs
         if: success()
         run: find app/build/outputs -name '*.apk' -exec ls -lh {} \;
