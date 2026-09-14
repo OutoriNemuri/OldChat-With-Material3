@@ -16,6 +16,7 @@ import androidx.compose.ui.unit.dp
 import com.oldchat.material.OldChatApplication
 import com.oldchat.material.core.cache.CacheManager
 import com.oldchat.material.core.cache.DpiManager
+import com.oldchat.material.core.network.ServerConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -48,16 +49,18 @@ fun FullSettingsScreen(
 
     var showDpiDialog by remember { mutableStateOf(false) }
     var showLogoutDialog by remember { mutableStateOf(false) }
-    var showServerDialog by remember { mutableStateOf(false) }
     var showFilesServerDialog by remember { mutableStateOf(false) }
     var showAboutDialog by remember { mutableStateOf(false) }
     var showLicensesDialog by remember { mutableStateOf(false) }
     var showReceiveModeDialog by remember { mutableStateOf(false) }
     var showFeedbackDialog by remember { mutableStateOf(false) }
     var showCacheDialog by remember { mutableStateOf(false) }
-    // BUG-03：必须以 ServerConfig 为唯一真相源。原实现是 `val ... by remember { mutableStateOf(...) }`，
-    // 只取一次初值，保存后 state 不更新 → 重开对话框显示旧地址，再点保存就把新地址回滚掉。
-    var serverUrl by remember { mutableStateOf(OldChatApplication.instance.serverConfig.baseUrl) }
+    // BUG-03：必须以 ServerConfig 为唯一真相源（保存后要同步刷新这里的状态）。
+    // 现在存的是「模式 + 自定义地址」两项，官方线路由 ServerConfig 常量拼出。
+    var serverMode by remember { mutableStateOf(OldChatApplication.instance.serverConfig.mode) }
+    var customServerUrl by remember {
+        mutableStateOf(OldChatApplication.instance.serverConfig.customBaseUrl)
+    }
     var filesServerUrl by remember { mutableStateOf(OldChatApplication.instance.serverConfig.filesBaseUrl) }
 
     // 缓存占用状态（后台 IO 计算）
@@ -106,18 +109,59 @@ fun FullSettingsScreen(
                 SectionHeader("服务器")
             }
             item(key = "server_config") {
-                SettingsRow(
-                    Icons.Filled.Cloud,
-                    "服务器地址",
-                    subtitle = serverUrl,
-                    onClick = { showServerDialog = true }
-                )
+                // 服务器设置区改为「单选模式 + 立即生效」（原先是弹对话框填 URL，
+                // 在设置页看不到当前用的到底是哪条线路）
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 8.dp)
+                ) {
+                    Text(
+                        "服务器线路",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    ServerModeSelector(
+                        mode = serverMode,
+                        customUrl = customServerUrl,
+                        onModeChange = { newMode ->
+                            serverMode = newMode
+                            if (newMode != ServerConfig.Mode.CUSTOM) {
+                                // 官方线路：立即生效，无需再点保存
+                                OldChatApplication.instance.serverConfig
+                                    .saveSelection(newMode, customServerUrl)
+                                // 令牌/会话绑定服务器，切换后立即失效
+                                OldChatApplication.instance.authManager.clearSession()
+                            }
+                        },
+                        onCustomUrlChange = { customServerUrl = it }
+                    )
+                    if (serverMode == ServerConfig.Mode.CUSTOM) {
+                        Spacer(Modifier.height(8.dp))
+                        Button(
+                            onClick = {
+                                val normalized = OldChatApplication.instance.serverConfig
+                                    .normalizeCustomInput(customServerUrl)
+                                customServerUrl = normalized
+                                OldChatApplication.instance.serverConfig
+                                    .saveSelection(ServerConfig.Mode.CUSTOM, normalized)
+                                OldChatApplication.instance.authManager.clearSession()
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("保存自定义地址")
+                        }
+                    }
+                }
             }
             item(key = "files_server") {
                 SettingsRow(
                     Icons.Filled.FolderOpen,
                     "文件服务器",
-                    subtitle = filesServerUrl.ifBlank { "未设置（跟随登录服务器）" },
+                    subtitle = filesServerUrl.ifBlank {
+                        "跟随登录服务器：${OldChatApplication.instance.serverConfig.mediaHostBase()}"
+                    },
                     onClick = { showFilesServerDialog = true }
                 )
             }
@@ -299,68 +343,69 @@ fun FullSettingsScreen(
         )
     }
 
-    // Server address dialog (§19.19 ServerBaseUrlManager)
-    if (showServerDialog) {
-        var url by remember { mutableStateOf(serverUrl) }
-        AlertDialog(
-            onDismissRequest = { showServerDialog = false },
-            title = { Text("服务器地址") },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("修改 OldChat Material API 服务器地址。留空恢复默认。",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    OutlinedTextField(
-                        value = url,
-                        onValueChange = { url = it },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    val normalized = url.trim()
-                    OldChatApplication.instance.serverConfig.baseUrl = normalized
-                    serverUrl = normalized   // BUG-03：同步刷新 UI 状态，避免下次打开显示旧值
-                    showServerDialog = false
-                }) { Text("保存") }
-            },
-            dismissButton = {
-                TextButton(onClick = { showServerDialog = false }) { Text("取消") }
-            }
-        )
-    }
+    // （原「服务器地址」对话框已删除：服务器线路改为设置页内联单选，
+    //   官方/自定义都由 ServerModeSelector 处理，见 server_config 项）
 
-    // Files server dialog
+    // Files server dialog（文件服务器 = 媒体主机根，可选；留空表示跟随登录服务器）
     if (showFilesServerDialog) {
         var url by remember { mutableStateOf(OldChatApplication.instance.serverConfig.filesBaseUrl) }
+        val normalizedPreview = OldChatApplication.instance.serverConfig
+            .normalizeFilesServerInput(url)
         AlertDialog(
             onDismissRequest = { showFilesServerDialog = false },
             title = { Text("文件服务器") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("修改文件/媒体服务器地址（可选）。",
+                    Text(
+                        "媒体/头像/音乐的下载线路。留空 = 跟随登录服务器。",
                         style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                     OutlinedTextField(
                         value = url,
                         onValueChange = { url = it },
                         singleLine = true,
+                        label = { Text("媒体服务器根地址") },
+                        placeholder = { Text("files.example.com") },
+                        leadingIcon = { Icon(Icons.Filled.FolderOpen, contentDescription = null) },
+                        supportingText = {
+                            Text(
+                                if (normalizedPreview.isEmpty()) {
+                                    "留空：媒体走登录服务器"
+                                } else {
+                                    "实际使用：$normalizedPreview"
+                                },
+                                style = MaterialTheme.typography.labelSmall
+                            )
+                        },
                         modifier = Modifier.fillMaxWidth()
+                    )
+                    Text(
+                        "会自动补 https://、去掉尾部斜杠与多余的 /v1（媒体路径由客户端拼）",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             },
             confirmButton = {
                 TextButton(onClick = {
-                    val normalized = url.trim()
+                    val normalized = OldChatApplication.instance.serverConfig
+                        .normalizeFilesServerInput(url)
                     OldChatApplication.instance.serverConfig.filesBaseUrl = normalized
-                    filesServerUrl = normalized   // BUG-03：同上，保持副标题与配置一致
+                    filesServerUrl = normalized   // 保持副标题与配置一致
                     showFilesServerDialog = false
                 }) { Text("保存") }
             },
             dismissButton = {
-                TextButton(onClick = { showFilesServerDialog = false }) { Text("取消") }
+                Row {
+                    // 一键恢复「跟随登录服务器」
+                    TextButton(onClick = {
+                        OldChatApplication.instance.serverConfig.filesBaseUrl = ""
+                        filesServerUrl = ""
+                        showFilesServerDialog = false
+                    }) { Text("清除") }
+                    TextButton(onClick = { showFilesServerDialog = false }) { Text("取消") }
+                }
             }
         )
     }

@@ -29,8 +29,7 @@ object MediaUploader {
     private const val THUMB_MAX_WIDTH = 300
     private const val THUMB_MAX_HEIGHT = 300
 
-    /** BUG-10：用 ContentResolver 元数据查询大小，避免为了判断大小而读取整个文件。 */
-    private fun querySize(context: Context, uri: Uri): Long {
+    /** BUG-10：用 ContentResolver 元数据查询大小，避免为了判断大小而读取整个文件。 */    private fun querySize(context: Context, uri: Uri): Long {
         return try {
             context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { it.length }
                 ?: -1L
@@ -41,6 +40,11 @@ object MediaUploader {
 
     data class UploadResult(
         val url: String,
+        /**
+         * 缩略图 URL。**服务端可能不返回**（2026-09-15 实测：`POST /v1/media`
+         * 只回 `url` + `original_url`，`thumb_url` 缺省）→ 调用方必须容忍 null，
+         * 展示时用 `thumbUrl ?: url` 回退到大图。
+         */
         val thumbUrl: String? = null
     )
 

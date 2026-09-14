@@ -86,10 +86,13 @@ class HomeViewModel : ViewModel() {
     private fun loadCache() {
         // Load recent chats
         cacheManager.recentChats.loadFromDisk()
+        // 会话列表 = 缓存的投影：任何写操作都会推一次，UI 立刻更新。
+        // （修「收到消息后首页预览/未读气泡不更新」：以前只在被显式通知时才刷新，
+        //   且刷新读的是可能过期的内存快照。220ms 去抖只为合并消息突发。）
         viewModelScope.launch {
-            recentChatsRefresh
+            cacheManager.recentChats.itemsFlow
                 .debounce(RECENT_CHATS_MERGE_MS)
-                .collect { _recentChats.value = cacheManager.recentChats.getAll() }
+                .collect { _recentChats.value = it }
         }
 
         _recentChats.value = cacheManager.recentChats.getAll()
@@ -111,9 +114,10 @@ class HomeViewModel : ViewModel() {
                 val peer = message.peerUid.ifEmpty { message.fromUid }
                 if (peer.isEmpty()) return@collect
                 val isOwn = message.fromUid == app.authManager.myUid
-                val existing = _recentChats.value.find {
-                    it.type == "direct" && (it.chatId == peer || it.chatId == message.fromUid)
-                }
+                // 从**缓存**读当前项（_recentChats 是去抖后的快照，连续消息会读到过期值
+                // → 未读计数少加、预览回退；之前就是这个原因）
+                val existing = cacheManager.recentChats.getByChatId(peer)
+                    ?: cacheManager.recentChats.getByChatId(message.fromUid)
                 val preview = extractPreview(message.msgType, message.body)
                 if (existing != null) {
                     val updated = existing.copy(
@@ -149,9 +153,7 @@ class HomeViewModel : ViewModel() {
                 if (gid.isEmpty()) return@collect
                 val isOwn = message.fromUid == app.authManager.myUid
                 val preview = extractPreview(message.msgType, message.body)
-                val existing = _recentChats.value.find {
-                    it.type == "group" && it.chatId == gid
-                }
+                val existing = cacheManager.recentChats.getByChatId(gid)
                 if (existing != null) {
                     val updated = existing.copy(
                         lastMessage = preview,
@@ -257,13 +259,14 @@ class HomeViewModel : ViewModel() {
         friends: List<User>,
         serverLastMessages: Map<String, Triple<String, String, Long>> = emptyMap()
     ) {
-        val existing = cacheManager.recentChats.getAll().associateBy { it.chatId }
-        val existingIds = existing.keys
+        val existingIds = cacheManager.recentChats.getAll().map { it.chatId }.toSet()
         var changed = false
         friends.forEach { friend ->
             if (friend.uid.isEmpty()) return@forEach
             val resolvedAvatar = resolveAvatarUrl(friend.avatarUrl)
-            val current = existing[friend.uid]
+            // 逐条从缓存取（不要用函数开头那份快照：期间可能已被 WS 更新，
+            // 用旧值回写会把刚收到的预览/未读覆盖掉）
+            val current = cacheManager.recentChats.getByChatId(friend.uid)
             val isNew = current == null
             if (isNew) {
                 // 新会话：插入完整条目
@@ -382,13 +385,13 @@ class HomeViewModel : ViewModel() {
         groups: List<Group>,
         serverLastMessages: Map<String, Triple<String, String, Long>> = emptyMap()
     ) {
-        val existing = cacheManager.recentChats.getAll().associateBy { it.chatId }
-        val existingIds = existing.keys
+        val existingIds = cacheManager.recentChats.getAll().map { it.chatId }.toSet()
         var changed = false
         groups.forEach { group ->
             if (group.id.isEmpty()) return@forEach
             val resolvedAvatar = resolveAvatarUrl(group.avatarUrl)
-            val current = existing[group.id]
+            // 同样逐条从缓存取，避免用过期快照回写
+            val current = cacheManager.recentChats.getByChatId(group.id)
             val isNew = current == null
             if (isNew) {
                 // 新会话：插入完整条目

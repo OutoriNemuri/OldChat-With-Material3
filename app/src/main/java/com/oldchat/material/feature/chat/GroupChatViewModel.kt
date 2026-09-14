@@ -207,6 +207,7 @@ class GroupChatViewModel : ViewModel() {
 
             val result = apiClient.get(
                 "/groups/messages/after",
+                // 参数名实测为 after_seq（2026-09-15 报告第 4 条：写成 seq= 会 400 invalid_after_seq）
                 mapOf("group_id" to groupId, "after_seq" to cursor.toString(), "limit" to "100")
             )
 

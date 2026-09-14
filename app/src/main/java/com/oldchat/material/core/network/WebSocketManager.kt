@@ -42,6 +42,13 @@ class WebSocketManager(
         private const val MAX_RECONNECT_DELAY_MS = 60_000L
         private const val RECONNECT_JITTER_FACTOR = 0.2 // ±20%
         private const val BOUNDED_QUEUE_CAPACITY = 256
+
+        /**
+         * 是否上报「正在输入」。
+         * 2026-09-15 实测该接口（/v2/chats/typing）对第三方不可用（400 invalid_json），
+         * 故默认关闭；服务端开放后改为 true 即可，接收侧无需改动。
+         */
+        private const val ENABLE_TYPING_UPLOAD = false
     }
 
     // Connection state
@@ -275,7 +282,8 @@ class WebSocketManager(
     private val apiClient by lazy { ApiClient(serverConfig, authManager, gson) }
 
     private fun buildWsUrl(token: String): String {
-        val baseUrl = serverConfig.resolveApiBase()
+        // WebSocket 固定在 v1（实测 /v1/ws 101 升级）；业务接口才随版本变化
+        val baseUrl = serverConfig.infraBase()
         val wsBase = baseUrl
             .replace("https://", "wss://")
             .replace("http://", "ws://")
@@ -536,10 +544,20 @@ class WebSocketManager(
      * 上报「正在输入」状态（§8.6 POST /v2/chats/typing）。
      * @param chatType "direct" 或 "group"
      */
+    /**
+     * 上报「正在输入」状态（文档写 §8.6 `POST /v2/chats/typing`）。
+     *
+     * ⚠️ 2026-09-15 实测（`shared/v2-selftest-20260915/报告-V2全量测试.md` 第 6 条）：
+     * 该接口对第三方客户端**不可用** —— 文档给的 payload 返回 `400 invalid_json`，
+     * 换过 15+ 种字段名/查询参数组合同样被拒，空 body 返回 `400 invalid_uid`。
+     * 因此这里默认**不再上报**（不做无意义请求、也不给自己刷限流）；
+     * 接收侧解析与「正在输入…」展示保持不变，等接口可用时把开关打开即可。
+     */
     fun sendTyping(chatType: String, peerUid: String? = null, groupId: String? = null) {
+        if (!ENABLE_TYPING_UPLOAD) return
         scope.launch {
             try {
-                                val body = if (chatType == "group") {
+                val body = if (chatType == "group") {
                     mapOf("chat_type" to "group", "group_id" to (groupId ?: ""))
                 } else {
                     mapOf("chat_type" to "direct", "peer_uid" to (peerUid ?: ""))

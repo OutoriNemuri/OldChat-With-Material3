@@ -216,16 +216,33 @@ fun CheckinScreen(
             onDismissRequest = { viewModel.dismissComments() },
             title = { Text("评论") },
             text = {
-                if (state.comments.isEmpty()) {
-                    Text("暂无评论", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                } else {
-                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        state.comments.forEach { c ->
-                            Column {
-                                Text(c.userName, style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.primary,
-                                    fontWeight = FontWeight.Bold)
-                                Text(c.body, style = MaterialTheme.typography.bodyMedium)
+                when {
+                    state.isLoadingComments -> {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                            Spacer(Modifier.width(10.dp))
+                            Text("正在加载评论…", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                    state.comments.isEmpty() -> {
+                        Text("暂无评论", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    else -> {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            state.comments.forEach { c ->
+                                Column {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(c.userName, style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.primary,
+                                            fontWeight = FontWeight.Bold)
+                                        if (c.createdAt.isNotEmpty()) {
+                                            Spacer(Modifier.width(6.dp))
+                                            Text(c.createdAt, style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                        }
+                                    }
+                                    Text(c.body, style = MaterialTheme.typography.bodyMedium)
+                                }
                             }
                         }
                     }
@@ -558,7 +575,9 @@ data class CheckinPost(
     val likeCount: Int,
     val commentCount: Int,
     val likedByMe: Boolean,
-    val user: CheckinUser
+    val user: CheckinUser,
+    /** 服务端若把评论内嵌在帖子里，这里一并解析（评论接口不可用时的兜底） */
+    val embeddedComments: List<CheckinComment> = emptyList()
 ) {
     companion object {
         fun fromMap(map: Map<*, *>): CheckinPost? {
@@ -575,6 +594,11 @@ data class CheckinPost(
             // createdAt 可能是 "2026-08-14T01:07:18Z" 格式，截取日期时间
             val rawTime = map["created_at"]?.toString() ?: ""
             val time = if (rawTime.length >= 16) rawTime.substring(0, 16).replace("T", " ") else rawTime
+            // 内嵌评论（若服务端随帖子返回）
+            val embedded = ((map["comments"] ?: map["comment_list"]) as? List<*>)
+                ?.filterIsInstance<Map<*, *>>()
+                ?.mapNotNull { CheckinComment.fromMap(it) }
+                ?: emptyList()
             return CheckinPost(
                 id = id,
                 contentText = map["content_text"]?.toString() ?: "",
@@ -584,7 +608,8 @@ data class CheckinPost(
                 likeCount = (map["like_count"] as? Number)?.toInt() ?: 0,
                 commentCount = (map["comment_count"] as? Number)?.toInt() ?: 0,
                 likedByMe = map["liked_by_me"] == true,
-                user = user
+                user = user,
+                embeddedComments = embedded
             )
         }
     }
@@ -595,7 +620,25 @@ data class CheckinComment(
     val body: String,
     val userName: String,
     val createdAt: String
-)
+) {
+    companion object {
+        fun fromMap(map: Map<*, *>): CheckinComment? {
+            val body = (map["body"] ?: map["content"] ?: map["text"])?.toString() ?: return null
+            if (body.isBlank()) return null
+            val userMap = map["user"] as? Map<*, *>
+            val name = (map["user_name"] ?: map["username"] ?: map["nickname"]
+                ?: userMap?.get("display_name") ?: userMap?.get("nickname")
+                ?: userMap?.get("username"))?.toString().orEmpty()
+            val rawTime = (map["created_at"] ?: map["time"] ?: map["createdAt"])?.toString() ?: ""
+            return CheckinComment(
+                id = (map["id"] ?: map["comment_id"])?.toString() ?: body.hashCode().toString(),
+                body = body,
+                userName = name.ifBlank { "匿名" },
+                createdAt = if (rawTime.length >= 16) rawTime.substring(0, 16).replace("T", " ") else rawTime
+            )
+        }
+    }
+}
 
 // ---- CheckinViewModel ----
 
@@ -617,6 +660,7 @@ data class CheckinUiState(
     // 查看评论
     val showCommentsDialog: Boolean = false,
     val commentsPost: CheckinPost? = null,
+    val isLoadingComments: Boolean = false,
     val comments: List<CheckinComment> = emptyList()
 )
 
@@ -729,7 +773,14 @@ class CheckinViewModel : ViewModel() {
                     app.gson.toJson(mapOf("post_id" to postId, "body" to content))
                 )
                 result.fold(
-                    onSuccess = { loadWall() },
+                    onSuccess = {
+                        loadWall()
+                        // 评论弹窗正开着同一个帖子时，顺手刷新评论列表
+                        val st = _uiState.value
+                        if (st.showCommentsDialog && st.commentsPost?.id == postId) {
+                            fetchComments(postId, st.commentsPost.embeddedComments)
+                        }
+                    },
                     onFailure = { e ->
                         _uiState.update { it.copy(errorMessage = e.message ?: "评论失败") }
                     }
@@ -786,15 +837,69 @@ class CheckinViewModel : ViewModel() {
 
     /** 查看评论：拉取评论列表。 */
     fun showComments(post: CheckinPost) {
-        // 规范给出 comment 发布接口，但未给出"评论列表"独立接口；展示已有评论数。
+        // 评论列表接口是存在的：GET /me/checkin/wall/comments?post_id=…
+        // （routes.md:200 有这条路由；之前这里写「规范未给出评论列表接口」并直接置空，
+        //   导致别人的评论只能发、看不到 → 现已接上）
         viewModelScope.launch {
             _uiState.update {
                 it.copy(
                     showCommentsDialog = true,
                     commentsPost = post,
-                    comments = listOf()
+                    comments = emptyList(),
+                    isLoadingComments = true,
+                    errorMessage = null
                 )
             }
+            fetchComments(post.id, post.embeddedComments)
+        }
+    }
+
+    /** 取某帖子的评论列表并写入状态；失败时回退到帖子内嵌评论 */
+    private suspend fun fetchComments(postId: String, fallback: List<CheckinComment>) {
+        try {
+            val result = app.apiClient.get(
+                "/me/checkin/wall/comments",
+                mapOf("post_id" to postId)
+            )
+            result.fold(
+                onSuccess = { body ->
+                    val list = parseComments(body).ifEmpty { fallback }
+                    _uiState.update { it.copy(comments = list, isLoadingComments = false) }
+                },
+                onFailure = { e ->
+                    _uiState.update {
+                        it.copy(
+                            comments = fallback,
+                            isLoadingComments = false,
+                            errorMessage = e.message ?: "评论加载失败"
+                        )
+                    }
+                }
+            )
+        } catch (e: Exception) {
+            _uiState.update {
+                it.copy(
+                    comments = fallback,
+                    isLoadingComments = false,
+                    errorMessage = "评论加载失败"
+                )
+            }
+        }
+    }
+
+    /** 解析评论列表：兼容裸数组与 {comments|items|list|data:[…]} 包装、多种字段名 */
+    private fun parseComments(json: String): List<CheckinComment> {
+        if (json.isBlank()) return emptyList()
+        return try {
+            val root = app.gson.fromJson(json, Any::class.java)
+            val rawList: List<*>? = when (root) {
+                is List<*> -> root
+                is Map<*, *> -> (root["comments"] ?: root["items"] ?: root["list"] ?: root["data"]) as? List<*>
+                else -> null
+            }
+            rawList?.filterIsInstance<Map<*, *>>()?.mapNotNull { CheckinComment.fromMap(it) } ?: emptyList()
+        } catch (_: Exception) {
+            emptyList()
         }
     }
 

@@ -162,7 +162,8 @@ fun GroupChatScreen(
                 shadowElevation = 8.dp,
                 color = MaterialTheme.colorScheme.surface
             ) {
-                Column(modifier = Modifier.navigationBarsPadding()) {
+                // 同单聊：edge-to-edge 下必须显式吃 IME inset，否则输入栏被软键盘盖住
+                Column(modifier = Modifier.navigationBarsPadding().imePadding()) {
                     // 引用预览条
                     val draft = quoteDraft
                     if (draft != null) {

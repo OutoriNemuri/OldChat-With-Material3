@@ -3,6 +3,7 @@ package com.oldchat.material.feature.auth
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.oldchat.material.OldChatApplication
+import com.oldchat.material.core.network.ServerConfig
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -68,15 +69,31 @@ class AuthViewModel : ViewModel() {
     }
 
     // ---- Server Config ----
+    //
+    // 模式（官方 v1 / 官方 v2 / 自定义）与自定义地址都存在 ServerConfig 里，
+    // 这里只做「读进 UI 状态」与「从 UI 状态保存」，不再自己拼 URL。
+
+    fun onServerModeChanged(mode: ServerConfig.Mode) {
+        _uiState.update { it.copy(serverMode = mode) }
+    }
 
     fun onServerUrlChanged(value: String) {
         _uiState.update { it.copy(customServerUrl = value) }
     }
 
-    fun saveServerUrl() {
-        val url = _uiState.value.customServerUrl.trim()
-        app.serverConfig.baseUrl = url
-        _uiState.update { it.copy(showServerConfig = false, errorMessage = null) }
+    fun saveServerSelection() {
+        val state = _uiState.value
+        val normalized = app.serverConfig.normalizeCustomInput(state.customServerUrl)
+        if (state.serverMode == ServerConfig.Mode.CUSTOM && normalized.isEmpty()) {
+            _uiState.update { it.copy(errorMessage = "请填写自定义服务器地址") }
+            return
+        }
+        app.serverConfig.saveSelection(state.serverMode, normalized)
+        // 切服务器后旧会话全部失效（会话与令牌都绑定服务器）
+        authManager.clearSession()
+        _uiState.update {
+            it.copy(showServerConfig = false, errorMessage = null, customServerUrl = normalized)
+        }
     }
 
     // ---- Navigation ----
@@ -93,7 +110,9 @@ class AuthViewModel : ViewModel() {
         _uiState.update {
             it.copy(
                 showServerConfig = !it.showServerConfig,
-                customServerUrl = app.serverConfig.baseUrl
+                // 打开面板时把当前配置读进 UI（之前是读 baseUrl，现在读模式 + 自定义地址）
+                serverMode = app.serverConfig.mode,
+                customServerUrl = app.serverConfig.customBaseUrl
             )
         }
     }
@@ -127,6 +146,9 @@ class AuthViewModel : ViewModel() {
 data class AuthUiState(
     // Mode
     val showServerConfig: Boolean = false,
+
+    /** 服务器选择：官方 v1 / 官方 v2 / 自定义 */
+    val serverMode: ServerConfig.Mode = ServerConfig.Mode.OFFICIAL_V1,
 
     // Login fields
     val username: String = "",

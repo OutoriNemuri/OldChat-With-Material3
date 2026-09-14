@@ -33,13 +33,20 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install SDK packages
+      # 不再用 android-actions/setup-android@v3：它内部执行 `sdkmanager tools`，
+      # 而该包在仓库元数据里已不存在 → `Failed to find package 'tools'` 直接整步失败
+      # （2026-09-15 实测，与项目代码无关）。ubuntu-latest 镜像本来就带 Android SDK
+      # （ANDROID_HOME=/usr/local/lib/android/sdk），直接用它的 sdkmanager 装缺失包即可。
+      - name: Install Android SDK packages
         run: |
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools" > /dev/null
+          SDKMANAGER=$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | tail -1)
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "sdkmanager=$SDKMANAGER"
+          test -n "$SDKMANAGER" || { echo "未找到 sdkmanager"; exit 1; }
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0" "platform-tools" > /dev/null
+          echo "SDK 就绪："
+          ls "$ANDROID_HOME/platforms" "$ANDROID_HOME/build-tools" 2>/dev/null
 
       - name: Gradle cache
         uses: actions/cache@v4
@@ -64,7 +71,9 @@ jobs:
 
       # 用真 JVM 跑一遍 BC 的 ML-KEM-768：验证 API 可用 + 长度与 enigmaj 抓包一致。
       # 这一步是「加密通话为什么会静默降级 P-256」的回归测试（详见 tools/kem_check/KemCheck.java）。
+      # 手动触发（workflow_dispatch）时才校验 ML-KEM；日常推送跳过（已验证过，省时间）
       - name: Verify BouncyCastle ML-KEM-768 API
+        if: github.event_name == 'workflow_dispatch'
         run: |
           # 从版本目录取 BC 版本，避免 find 命中 Gradle 缓存里的旧版本 jar
           BCVER=$(sed -n 's/.*bcprov-jdk18on.*version = "\([^"]*\)".*/\1/p' gradle/libs.versions.toml | head -1)

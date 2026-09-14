@@ -72,6 +72,14 @@ fun ChatScreen(
         (it is EncryptedCallManager.CallState.Connected && it.peer == friendUid) ||
             (it is EncryptedCallManager.CallState.Establishing && it.peer == friendUid)
     }
+    // 顶部状态栏是否属于「本会话」：凡是通话对象是当前对端的都显示（含 Ended，
+    // 好在挂断后仍能看到「已结束/对方已结束」的提示）；切到别的会话则不显示。
+    val callBelongsToThisChat = when (val s = callState) {
+        is EncryptedCallManager.CallState.Connected -> s.peer == friendUid
+        is EncryptedCallManager.CallState.Establishing -> s.peer == friendUid
+        is EncryptedCallManager.CallState.Ended -> s.peer == friendUid
+        else -> false
+    }
     var callOverlayVisible by remember { mutableStateOf(false) }
     // 挂断确认框状态：必须在下面的通话页分支之前声明（Kotlin 局部变量按声明顺序可见）
     var showHangUpConfirm by remember { mutableStateOf(false) }
@@ -233,7 +241,9 @@ fun ChatScreen(
                 shadowElevation = 8.dp,
                 color = MaterialTheme.colorScheme.surface
             ) {
-                Column(modifier = Modifier.navigationBarsPadding()) {
+                // imePadding：MainActivity 用了 enableEdgeToEdge()（decorFitsSystemWindows=false），
+                // 窗口不会因软键盘而 resize —— 必须显式加 IME inset，否则输入栏被键盘盖住。
+                Column(modifier = Modifier.navigationBarsPadding().imePadding()) {
                     // 引用预览条
                     val draft = quoteDraft
                     if (draft != null) {
@@ -316,14 +326,18 @@ fun ChatScreen(
     ) { padding ->
         Column(modifier = Modifier.fillMaxSize().padding(padding)) {
             // 加密通话状态栏（通话中/握手中/刚结束 时出现）
-            EncryptedCallBar(
-                state = callState,
-                elapsedSeconds = callElapsedSeconds,
-                queueHint = callQueueHint,
-                onHangUp = { showHangUpConfirm = true },
-                onDismiss = { chatViewModel.dismissCallResult() },
-                onExpand = { callOverlayVisible = true }
-            )
+            // 加密通话状态栏（仅当通话对象就是本会话时才显示 —— 否则切到别的会话
+            // 还会看到 A 的通话条幅，属于串会话显示）
+            if (callBelongsToThisChat) {
+                EncryptedCallBar(
+                    state = callState,
+                    elapsedSeconds = callElapsedSeconds,
+                    queueHint = callQueueHint,
+                    onHangUp = { showHangUpConfirm = true },
+                    onDismiss = { chatViewModel.dismissCallResult() },
+                    onExpand = { callOverlayVisible = true }
+                )
+            }
         Box(modifier = Modifier.fillMaxSize()) {
         LazyColumn(
             modifier = Modifier

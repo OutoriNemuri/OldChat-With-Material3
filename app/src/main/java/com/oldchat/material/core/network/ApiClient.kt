@@ -37,6 +37,23 @@ class ApiClient(
 ) {
     private val ktorClient get() = HttpClientProvider.ktorClient
 
+    /**
+     * 基址选择（依据 2026-09-15 的 v2 全量测试报告）：
+     *   - **业务接口**：随所选版本走 → [ServerConfig.businessBase]（v1 或 v2）
+     *   - **基础设施接口**：认证 / 我的信息 / WebSocket / 媒体上传/下载 **固定 v1**
+     *     → [ServerConfig.infraBase]
+     * 规则只在这里写一次，调用方继续用版本无关的相对路径（如 "/direct/send"），
+     * 因此全工程不再需要写死 `/v1/` 或 `/v2/`。
+     */
+    private fun baseFor(path: String): String =
+        if (isInfraPath(path)) serverConfig.infraBase() else serverConfig.businessBase()
+
+    private fun isInfraPath(path: String): Boolean =
+        path.startsWith("/auth/") ||
+            path == "/me" || path.startsWith("/me/") ||
+            path.startsWith("/media") ||
+            path.startsWith("/ws")
+
     // Exclude these paths from automatic token refresh (would cause infinite loop)
     private val refreshExcludePaths = setOf(
         "/auth/login",
@@ -60,7 +77,7 @@ class ApiClient(
      */
     suspend fun get(path: String, params: Map<String, String> = emptyMap()): Result<String> {
         return executeWithAuth(path) { token ->
-            val response = ktorClient.get("${serverConfig.resolveApiBase()}$path") {
+            val response = ktorClient.get("${baseFor(path)}$path") {
                 if (token != null) {
                     header("Authorization", "Bearer $token")
                 }
@@ -86,7 +103,7 @@ class ApiClient(
         headers: Map<String, String> = emptyMap()
     ): Result<String> {
         return executeWithAuth(path) { token ->
-            val response = ktorClient.post("${serverConfig.resolveApiBase()}$path") {
+            val response = ktorClient.post("${baseFor(path)}$path") {
                 if (token != null) {
                     header("Authorization", "Bearer $token")
                 }
@@ -115,7 +132,7 @@ class ApiClient(
     ): Result<String> {
         return executeWithAuth(path) { token ->
             val response = ktorClient.submitFormWithBinaryData(
-                url = "${serverConfig.resolveApiBase()}$path",
+                url = "${baseFor(path)}$path",
                 formData = formData {
                     formParts.forEach { part ->
                         when (part) {
@@ -252,7 +269,7 @@ class ApiClient(
             }
 
             try {
-                val response = ktorClient.post("${serverConfig.resolveApiBase()}/auth/refresh") {
+                val response = ktorClient.post("${serverConfig.infraBase()}/auth/refresh") {
                     contentType(ContentType.Application.Json)
                     setBody("""{"refresh_token":"$currentRefreshToken"}""")
                     // No Authorization header for refresh
@@ -307,7 +324,7 @@ class ApiClient(
         authManager.invalidateAuthOperations()
 
         return try {
-            val response = ktorClient.post("${serverConfig.resolveApiBase()}/auth/login") {
+            val response = ktorClient.post("${serverConfig.infraBase()}/auth/login") {
                 contentType(ContentType.Application.Json)
                 setBody(
                     gson.toJson(
@@ -337,6 +354,14 @@ class ApiClient(
                     authManager.savedPassword = password
                     return Result.success(Unit)
                 }
+            }
+
+            // 429 限流（2026-09-15 实测：一次失败登录后紧接重登会被限流，稍等即恢复；
+            // refresh 令牌不受影响）——给出可读提示，避免用户以为是密码错了。
+            if (response.status.value == 429) {
+                return Result.failure(
+                    AuthException("登录过于频繁，请稍等片刻再试（服务端限流）")
+                )
             }
 
             Result.failure(AuthException("Login failed: ${response.status.value}"))
@@ -390,7 +415,7 @@ class ApiClient(
                 val clientPublicKey = CryptoUtil.publicKeyToBase64(keyPair.public)
 
                 // POST /auth/handshake（明文，字段名 client_pub，需带 Authorization 头）
-                val response = ktorClient.post("${serverConfig.resolveApiBase()}/auth/handshake") {
+                val response = ktorClient.post("${serverConfig.infraBase()}/auth/handshake") {
                     contentType(ContentType.Application.Json)
                     header("Authorization", "Bearer ${authManager.accessToken ?: ""}")
                     setBody("""{"client_pub":"$clientPublicKey"}""")

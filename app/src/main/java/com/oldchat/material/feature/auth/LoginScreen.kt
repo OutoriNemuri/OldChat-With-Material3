@@ -2,6 +2,8 @@ package com.oldchat.material.feature.auth
 
 import androidx.compose.animation.*
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -13,6 +15,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.*
 import com.oldchat.material.OldChatApplication
+import com.oldchat.material.feature.settings.ServerModeSelector
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -63,13 +66,19 @@ fun LoginScreen(
     Scaffold(
         snackbarHost = { SnackbarHost(snackbarHostState) }
     ) { padding ->
-        Box(
+        // 小屏裁切修复：内容放进可滚动容器，并用 Arrangement.Center 在空间足够时保持居中。
+        // 之前是 Box(center) + 不可滚动卡片 —— 卡片比屏幕高时，底部的「注册」和「服务器设置」
+        // 被挤出可视区（但仍在布局里，所以「能点到但看不见」）。
+        Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(padding),
-            contentAlignment = Alignment.Center
+                .padding(padding)
+                .verticalScroll(rememberScrollState())
+                .imePadding()
+                .padding(vertical = 16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
         ) {
-            // Animated content switch (only login vs server-config now)
             AnimatedContent(
                 targetState = uiState.showServerConfig,
                 transitionSpec = {
@@ -355,29 +364,23 @@ private fun ServerConfigCard(viewModel: AuthViewModel, uiState: AuthUiState) {
                 tint = MaterialTheme.colorScheme.primary
             )
             Text(
-                text = "服务器设置",
+                text = "选择服务器",
                 style = MaterialTheme.typography.headlineMedium,
                 color = MaterialTheme.colorScheme.primary
             )
             Text(
-                text = "自定义 OldChat Material 服务器地址\n留空使用默认服务器",
+                text = "官方线路可直接用；自建服务器请选「自定义」。",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center
             )
 
-            OutlinedTextField(
-                value = uiState.customServerUrl,
-                onValueChange = viewModel::onServerUrlChanged,
-                label = { Text("服务器地址") },
-                placeholder = { Text(com.oldchat.material.OldChatApplication.instance.serverConfig.baseUrl) },
-                leadingIcon = {
-                    Icon(Icons.Filled.Link, contentDescription = null)
-                },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-                shape = MaterialTheme.shapes.medium,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri)
+            // 单选：官方（v1）/ 官方（v2）/ 自定义（控件与设置页共用）
+            ServerModeSelector(
+                mode = uiState.serverMode,
+                customUrl = uiState.customServerUrl,
+                onModeChange = viewModel::onServerModeChanged,
+                onCustomUrlChange = viewModel::onServerUrlChanged
             )
 
             Row(
@@ -391,7 +394,7 @@ private fun ServerConfigCard(viewModel: AuthViewModel, uiState: AuthUiState) {
                     Text("返回")
                 }
                 Button(
-                    onClick = viewModel::saveServerUrl,
+                    onClick = viewModel::saveServerSelection,
                     modifier = Modifier.weight(1f)
                 ) {
                     Text("保存")

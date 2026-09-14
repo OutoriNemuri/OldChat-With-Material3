@@ -88,7 +88,8 @@ fun VibeCodingScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(horizontal = 12.dp, vertical = 8.dp)
-                        .navigationBarsPadding(),
+                        .navigationBarsPadding()
+                        .imePadding(),   // 同聊天页：edge-to-edge 下需要显式 IME inset
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     OutlinedTextField(

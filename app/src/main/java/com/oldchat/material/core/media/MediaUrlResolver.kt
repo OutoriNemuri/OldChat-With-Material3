@@ -4,160 +4,82 @@ import android.net.Uri
 import com.oldchat.material.core.network.ServerConfig
 
 /**
- * Resolves media URLs with multi-candidate fallback.
- * Mirrors MediaUrlResolver from client-guide.md §6.1.
+ * 媒体 URL 的候选线路解析（client-guide §6.1）。
  *
- * Candidate order:
- * 1. https://files.mcl0.dpdns.org/{oss_path}
- * 2. http://60.205.94.101:8080/v1/uploads/{path}
- * 3. https://oc.mcl0.dpdns.org/v1/uploads/{path}
- * 4. {HttpUtil.BASE_URL}/v1/uploads/{path}
+ * 本类**不再自己维护任何硬编码域名或 `/v1/` 前缀** —— 全部交给 [ServerConfig]：
+ *   - 主机优先级：文件服务器（若配置）→ 当前 API 主机 → 官方主机
+ *   - 路径前缀：`ServerConfig.MEDIA_PATH_PREFIX`（服务器规定媒体固定在 v1 的 uploads 下）
  *
- * Rules:
- * - Relative paths (/v1/uploads/media/a.jpg) → generate all 4 candidates
- * - Absolute URLs from known sources → rewrite to 4 candidates
- * - Third-party absolute URLs → keep original, don't rewrite
+ * 规则（保持与旧实现一致）：
+ *   - 相对路径 `/v1/uploads/media/a.jpg` → 展开为多条候选线路
+ *   - 来自已知线路的绝对 URL → 按同路径改写成多条候选
+ *   - 第三方绝对 URL → 原样返回，不改写
  */
 object MediaUrlResolver {
 
-    private val KNOWN_HOSTS = setOf(
-        "files.mcl0.dpdns.org",
-        "60.205.94.101",
-        "oc.mcl0.dpdns.org",
-        "aliyuncs.com"
-    )
+    private fun serverConfig(): ServerConfig =
+        com.oldchat.material.OldChatApplication.instance.serverConfig
 
-    // 动态读取当前登录服务器与文件服务器配置（跟随登录/设置）。
-    private fun serverConfig(): ServerConfig = com.oldchat.material.OldChatApplication.instance.serverConfig
-
-    // 优先级最高的媒体根：文件服务器 > API 服务器主机。
+    /** 主线路：文件服务器 > API 主机 */
     private fun primaryMediaBase(): String = serverConfig().resolveMediaBase()
 
-    // 兜底候选（保持多线路容错）：当前文件服务器 + 旧主站 + CF 主站 + OSS。
-    private val FALLBACK_BASES: List<String> get() = listOf(
-        serverConfig().mediaHostBase(),            // 登录 API 服务器主机
-        "https://oc.mcl0.dpdns.org",               // CF 主站
-        "https://files.mcl0.dpdns.org"             // OSS 自定义域名
-    )
-
-    /**
-     * Resolve a media URL to its primary candidate.
-     * Returns the first candidate (fastest path).
-     */
+    /** 解析为主线路（第一个候选） */
     fun resolve(url: String?): String? {
         if (url == null) return null
         return resolveCandidates(url).firstOrNull()
     }
 
-    /**
-     * Resolve a media URL to all candidates.
-     * Consumers should iterate through candidates on failure.
-     */
+    /** 解析为全部候选线路（调用方按顺序回退） */
     fun resolveCandidates(url: String?): List<String> {
-        if (url == null) return emptyList()
+        if (url.isNullOrBlank()) return emptyList()
 
-        // If it's an absolute URL from a known source
         if (url.startsWith("http://") || url.startsWith("https://")) {
-            val uri = Uri.parse(url)
-            val host = uri.host ?: return listOf(url)
-
-            // Third-party URL: keep as-is
-            if (!isKnownHost(host)) {
-                return listOf(url)
-            }
-
-            // Known source: extract path and generate all candidates
-            val path = uri.path ?: "/"
-            val cleanPath = cleanPath(path)
-            if (cleanPath.startsWith("/v1/uploads/")) {
-                val relativePath = cleanPath.removePrefix("/v1/uploads/")
-                return buildMediaCandidates(relativePath)
-            }
-            // OSS path
-            return buildOssCandidates(cleanPath)
+            val host = Uri.parse(url).host ?: return listOf(url)
+            // 第三方 URL：不改写
+            if (!isKnownHost(host)) return listOf(url)
+            // 已知线路：按同路径展开候选（由 ServerConfig 统一生成）
+            return serverConfig().alternativeOriginsFor(url)
         }
 
-        // Relative path
-        if (url.startsWith("/v1/uploads/")) {
-            val relativePath = url.removePrefix("/v1/uploads/")
-            return buildMediaCandidates(relativePath)
-        }
-
-        // Other relative path: try as OSS
-        return buildOssCandidates(url)
+        // 相对路径：交给 ServerConfig（它会带上 MEDIA_PATH_PREFIX）
+        return serverConfig().resolveMediaUrlCandidates(url)
     }
 
-    /**
-     * Returns the next candidate after the current one.
-     */
+    /** 当前 URL 的下一个候选线路（没有则 null） */
     fun resolveNextCandidate(currentUrl: String): String? {
         val candidates = resolveCandidates(currentUrl)
         val currentIndex = candidates.indexOf(currentUrl)
-        if (currentIndex >= 0 && currentIndex < candidates.size - 1) {
-            return candidates[currentIndex + 1]
-        }
-        return null
-    }
-
-    private fun buildMediaCandidates(relativePath: String): List<String> {
-        val cleanPath = if (relativePath.startsWith("/")) relativePath else "/$relativePath"
-        val primary = primaryMediaBase()
-        val candidates = mutableListOf<String>()
-        // 1. 首选：文件服务器 / 登录 API 服务器主机（动态跟随）
-        candidates.add("$primary/v1/uploads$cleanPath")
-        // 2. 兜底线路（去重后追加）
-        FALLBACK_BASES.forEach { base ->
-            val url = "$base/v1/uploads$cleanPath"
-            if (url !in candidates) candidates.add(url)
-        }
-        return candidates
-    }
-
-    private fun buildOssCandidates(ossPath: String): List<String> {
-        val cleanPath = if (ossPath.startsWith("/")) ossPath else "/$ossPath"
-        // For OSS paths that don't have /v1/uploads prefix
-        return buildMediaCandidates(cleanPath)
-    }
-
-    private fun cleanPath(path: String): String {
-        var clean = path
-        // Remove double slashes
-        while (clean.contains("//")) {
-            clean = clean.replace("//", "/")
-        }
-        // Remove trailing slash unless it's just "/"
-        if (clean.length > 1 && clean.endsWith("/")) {
-            clean = clean.dropLast(1)
-        }
-        return clean
-    }
-
-    private fun isKnownHost(host: String): Boolean {
-        if (KNOWN_HOSTS.any { host == it || host.endsWith(".$it") }) {
-            return true
-        }
-        // IoT servers (60.*)
-        if (host.startsWith("60.")) {
-            return true
-        }
-        // Data server
-        if (host.contains("dpdns.org")) {
-            return true
-        }
-        return false
+        return if (currentIndex in 0 until candidates.size - 1) candidates[currentIndex + 1] else null
     }
 
     /**
-     * Determine if auth token should be attached for this URL.
-     * Only for OldChat trusted servers; NOT for files OSS or third-party (§6.1).
+     * 是否属于 OldChat 可信线路 —— 决定要不要带 Authorization。
+     * 判定依据改为「与当前配置的主机同源 / 官方主机同源」，不再列举域名。
+     */
+    private fun isKnownHost(host: String): Boolean {
+        val known = buildList {
+            add(runCatching { Uri.parse(serverConfig().mediaHostBase()).host }.getOrNull())
+            add(runCatching { Uri.parse(serverConfig().resolveMediaBase()).host }.getOrNull())
+            add(runCatching { Uri.parse(ServerConfig.OFFICIAL_HOST).host }.getOrNull())
+            val files = serverConfig().filesBaseUrl
+            if (files.isNotBlank()) add(runCatching { Uri.parse(files).host }.getOrNull())
+        }.filterNotNull()
+        return known.any { host == it || host.endsWith(".$it") }
+    }
+
+    /**
+     * 是否给该 URL 附带登录令牌。
+     * 规则：可信线路带；文件/OSS 服务器不带（§6.1 明确要求不外泄令牌）。
      */
     fun shouldAttachAuth(url: String?): Boolean {
-        if (url == null) return false
-        val uri = Uri.parse(url)
-        val host = uri.host ?: return false
-        // Don't attach auth to OSS files server
-        if (host == "files.mcl0.dpdns.org") return false
-        // Attach auth to known OldChat servers
+        if (url.isNullOrBlank()) return false
+        val host = Uri.parse(url).host ?: return false
+
+        val filesHost = serverConfig().filesBaseUrl
+            .takeIf { it.isNotBlank() }
+            ?.let { runCatching { Uri.parse(it).host }.getOrNull() }
+        if (filesHost != null && host == filesHost) return false
+
         return isKnownHost(host)
     }
 }
