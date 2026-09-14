@@ -66,9 +66,12 @@ jobs:
       # 这一步是「加密通话为什么会静默降级 P-256」的回归测试（详见 tools/kem_check/KemCheck.java）。
       - name: Verify BouncyCastle ML-KEM-768 API
         run: |
-          JAR=$(find ~/.gradle/caches -name 'bcprov-jdk18on-*.jar' | head -1)
+          # 从版本目录取 BC 版本，避免 find 命中 Gradle 缓存里的旧版本 jar
+          BCVER=$(sed -n 's/.*bcprov-jdk18on.*version = "\([^"]*\)".*/\1/p' gradle/libs.versions.toml | head -1)
+          JAR=$(find ~/.gradle/caches -name "bcprov-jdk18on-${BCVER}.jar" | head -1)
+          echo "catalog BC version: $BCVER"
           echo "BC jar: $JAR"
-          test -n "$JAR" || { echo "未找到 bcprov jar"; exit 1; }
+          test -n "$JAR" || { echo "未找到 bcprov-jdk18on-${BCVER}.jar"; exit 1; }
           mkdir -p /tmp/kemcheck
           javac -cp "$JAR" -d /tmp/kemcheck .github/kem_check/KemCheck.java
           java -cp "$JAR:/tmp/kemcheck" KemCheck
