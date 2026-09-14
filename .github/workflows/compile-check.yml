@@ -70,7 +70,7 @@ jobs:
           echo "BC jar: $JAR"
           test -n "$JAR" || { echo "未找到 bcprov jar"; exit 1; }
           mkdir -p /tmp/kemcheck
-          javac -cp "$JAR" -d /tmp/kemcheck tools/kem_check/KemCheck.java
+          javac -cp "$JAR" -d /tmp/kemcheck .github/kem_check/KemCheck.java
           java -cp "$JAR:/tmp/kemcheck" KemCheck
 
       - name: Show APK outputs
