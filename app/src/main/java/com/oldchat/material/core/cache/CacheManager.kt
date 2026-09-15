@@ -243,7 +243,8 @@ class CacheManager(context: Context) {
             }
             "images" -> deleteDirRecursive(File(context.cacheDir, "image_cache"))
             "voice" -> {
-                File(context.cacheDir).listFiles()
+                // cacheDir 本身就是 File；原来是 File(context.cacheDir)（把 File 当路径字符串传，编译不过）
+                context.cacheDir.listFiles()
                     ?.filter { it.isFile && (it.name.startsWith("voice_") || it.name.endsWith(".tmp")) }
                     ?.forEach { it.delete() }
             }
@@ -257,8 +258,10 @@ class CacheManager(context: Context) {
         messageHistory.entries().map { entry ->
             val id = entry.key.removePrefix("direct_").removePrefix("group_")
             val type = if (entry.key.startsWith("group_")) "group" else "direct"
+            // 注意括号：`a ?: if (...) b else c ?: d` 会把 `?: d` 只绑到 else 分支，
+            // 导致 then 分支仍是可空类型 → 必须显式加括号
             val title = recentChats.getByChatId(id)?.name
-                ?: if (type == "group") groups.get(id)?.name else friends.get(id)?.nickname
+                ?: (if (type == "group") groups.get(id)?.name else friends.get(id)?.nickname)
                 ?: id
             ConversationCache(
                 key = entry.key,
