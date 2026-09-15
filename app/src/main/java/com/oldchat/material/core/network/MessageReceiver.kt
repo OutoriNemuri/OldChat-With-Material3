@@ -33,13 +33,16 @@ class MessageReceiver(
     companion object {
         private const val TAG = "MessageReceiver"
         /**
-         * 兜底轮询间隔。走的是 /updates/difference 增量游标（不是朴素全量刷新），
-         * 但没必要 5 秒一次：
-         *   WS 已连接 → 只当保险，30s 一次；
-         *   WS 断开   → 15s 一次（仍远低于原来的 5s 固定频率）。
+         * 兜底轮询间隔。
+         *
+         * 取的是「兜底仍然够快」而不是「越快越好」：
+         *   WS 已连接 → 15s（服务器不推/推丢了也能在 15s 内补上；原来被我调到 30s，
+         *               实测表现为「接收速度大幅下降」）
+         *   WS 断开   → 5s（与历史行为一致，这是断线期间唯一的接收途径）
+         * 另外：进入会话 / 回到前台会调用 [pollNow] 立即补一次，不必等周期。
          */
-        private const val POLL_INTERVAL_WS_UP_MS = 30_000L
-        private const val POLL_INTERVAL_WS_DOWN_MS = 15_000L
+        private const val POLL_INTERVAL_WS_UP_MS = 15_000L
+        private const val POLL_INTERVAL_WS_DOWN_MS = 5_000L
     }
 
     enum class Mode(val key: String, val label: String) {
@@ -54,6 +57,11 @@ class MessageReceiver(
     }
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    /** 用于「立即轮询」的唤醒信号 */
+    private val pollSignal = kotlinx.coroutines.channels.Channel<Unit>(
+        kotlinx.coroutines.channels.Channel.CONFLATED
+    )
     private var pollJob: Job? = null
     private var modeJob: Job? = null
     private var pollingObserverJob: Job? = null
@@ -135,9 +143,23 @@ class MessageReceiver(
         pollJob = scope.launch {
             while (isActive) {
                 pollOnce()
-                delay(pollInterval())
+                // 周期性等待，但被 pollNow() 唤醒时立即再拉一次
+                withTimeoutOrNull(pollInterval()) { pollSignal.receive() }
             }
         }
+    }
+
+    /**
+     * 立刻执行一次兜底拉取（进入会话、回到前台、手动刷新时调用）。
+     * 不影响周期节奏：只是把当前这一轮的等待提前结束。
+     */
+    fun pollNow() {
+        if (pollJob?.isActive != true) {
+            // 未在轮询（如 WS_ONLY 模式）时也允许单次拉取
+            scope.launch { pollOnce() }
+            return
+        }
+        pollSignal.trySend(Unit)
     }
 
     private fun pollInterval(): Long =

@@ -11,6 +11,7 @@ import com.oldchat.material.core.model.RecentChatItem
 import com.oldchat.material.core.model.User
 import com.oldchat.material.core.model.Group
 import com.oldchat.material.core.network.WebSocketManager
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 
@@ -231,6 +232,174 @@ class HomeViewModel : ViewModel() {
     fun refreshChats() {
         cacheManager.recentChats.loadFromDisk()
         requestRecentChatsRefresh()   // ALIGN-12：合并刷新
+    }
+
+    // ---- 首次使用：一次性把基础数据灌进本地缓存 ----
+
+    /** 本机是否已有可用缓存（会话列表 / 好友 / 消息历史任一非空即视为有） */
+    fun hasBasicCache(): Boolean =
+        cacheManager.recentChats.getAll().isNotEmpty() ||
+            cacheManager.friends.getAll().isNotEmpty()
+
+    private val _prefetchState = MutableStateFlow(PrefetchState())
+    val prefetchState: StateFlow<PrefetchState> = _prefetchState.asStateFlow()
+
+    data class PrefetchState(
+        val running: Boolean = false,
+        val finished: Boolean = false,
+        val friends: Int = 0,
+        val groups: Int = 0,
+        val previews: Int = 0,
+        val skipped: Boolean = false,
+        val message: String? = null
+    )
+
+    /**
+     * 首次启动引导用：**一次性、有上限**地拉取基础数据进缓存。
+     *
+     * 内容：
+     *   1. 通讯录：`/friends` + `/groups/list`（含头像相对路径、群名、头像）
+     *   2. 每个会话的最新一条消息预览（把「最近消息」落到会话列表）
+     *   3. 少量历史消息：每个会话最多 [PREFETCH_MESSAGES_PER_CHAT] 条，
+     *      总会话数上限 [PREFETCH_MAX_CHATS]、并发 [PREFETCH_CONCURRENCY]
+     *
+     * 为什么有上限：规范 §0 明确禁止朴素全量刷新（会被监测/限流）。
+     * 这里是用户明确同意的一次性动作，所以允许回源，但必须**有界**。
+     */
+    fun prefetchBasics() {
+        if (_prefetchState.value.running) return
+        _prefetchState.value = PrefetchState(running = true)
+
+        viewModelScope.launch {
+            var friends = 0
+            var groups = 0
+            var previews = 0
+            try {
+                // 1) 通讯录
+                app.apiClient.get("/friends").onSuccess { json ->
+                    val list = parseFriends(json)
+                    if (list.isNotEmpty()) {
+                        friends = list.size
+                        cacheManager.friends.replaceAll(list)
+                        _friends.value = list
+                        syncChatListFromFriends(list, parseServerLastMessages(json))
+                    }
+                }
+                app.apiClient.get("/groups/list").onSuccess { json ->
+                    val list = parseGroups(json)
+                    if (list.isNotEmpty()) {
+                        groups = list.size
+                        cacheManager.groups.replaceAll(list)
+                        _groups.value = list
+                        syncChatListFromGroups(list, parseServerLastMessages(json))
+                    }
+                    _prefetchState.value = _prefetchState.value.copy(friends = friends, groups = groups)
+                }
+
+                // 2) + 3) 会话预览与少量历史（有界 + 受限并发）
+                val targets = cacheManager.recentChats.getAll()
+                    .filter { it.chatId.isNotEmpty() }
+                    .take(PREFETCH_MAX_CHATS)
+                val gate = kotlinx.coroutines.sync.Semaphore(PREFETCH_CONCURRENCY)
+                val jobs = targets.map { item ->
+                    async {
+                        gate.withPermit {
+                            val ok = when (item.type) {
+                                "group" -> prefetchGroupHistory(item.chatId)
+                                else -> prefetchDirectHistory(item.chatId)
+                            }
+                            if (ok) previews++
+                        }
+                    }
+                }
+                jobs.forEach { it.await() }
+                _prefetchState.value = PrefetchState(
+                    running = false,
+                    finished = true,
+                    friends = friends,
+                    groups = groups,
+                    previews = previews,
+                    message = "已缓存 $friends 位好友 · $groups 个群 · $previews 个会话的消息"
+                )
+            } catch (e: Exception) {
+                _prefetchState.value = PrefetchState(
+                    running = false,
+                    finished = true,
+                    friends = friends,
+                    groups = groups,
+                    previews = previews,
+                    message = "部分数据获取失败：${e.message ?: "网络异常"}"
+                )
+            }
+        }
+    }
+
+    private suspend fun prefetchDirectHistory(uid: String): Boolean {
+        val result = app.apiClient.get(
+            "/direct/messages/v2",
+            mapOf("with_uid" to uid, "limit" to PREFETCH_MESSAGES_PER_CHAT.toString())
+        )
+        val body = result.getOrNull() ?: return false
+        val list = runCatching {
+            val root = app.gson.fromJson(body, Map::class.java) as? Map<*, *>
+            val arr = root?.get("messages") as? List<*> ?: return false
+            arr.mapNotNull { item ->
+                runCatching {
+                    app.gson.fromJson(app.gson.toJson(item), com.oldchat.material.core.model.Message::class.java)
+                }.getOrNull()
+            }
+        }.getOrDefault(emptyList())
+        if (list.isEmpty()) return false
+        cacheManager.saveDirectMessages(uid, list)
+        // 用最新一条回填会话列表预览
+        val latest = list.maxByOrNull { it.createdAt } ?: return false
+        val current = cacheManager.recentChats.getByChatId(uid) ?: return false
+        if (latest.createdAt >= current.lastTime) {
+            cacheManager.recentChats.upsert(
+                current.copy(
+                    lastMessage = extractPreview(latest.msgType, latest.body),
+                    lastMessageType = latest.msgType,
+                    lastTime = latest.createdAt
+                )
+            )
+        }
+        return true
+    }
+
+    private suspend fun prefetchGroupHistory(groupId: String): Boolean {
+        val result = app.apiClient.get(
+            "/groups/messages/v2",
+            mapOf("group_id" to groupId, "limit" to PREFETCH_MESSAGES_PER_CHAT.toString())
+        )
+        val body = result.getOrNull() ?: return false
+        val list = runCatching {
+            val root = app.gson.fromJson(body, Map::class.java) as? Map<*, *>
+            val arr = root?.get("messages") as? List<*> ?: return false
+            arr.mapNotNull { item ->
+                runCatching {
+                    app.gson.fromJson(app.gson.toJson(item),
+                        com.oldchat.material.core.model.GroupMessage::class.java)
+                }.getOrNull()
+            }
+        }.getOrDefault(emptyList())
+        if (list.isEmpty()) return false
+        cacheManager.saveGroupMessages(groupId, list)
+        val latest = list.maxByOrNull { it.createdAt } ?: return false
+        val current = cacheManager.recentChats.getByChatId(groupId) ?: return false
+        if (latest.createdAt >= current.lastTime) {
+            cacheManager.recentChats.upsert(
+                current.copy(
+                    lastMessage = extractPreview(latest.msgType, latest.body),
+                    lastMessageType = latest.msgType,
+                    lastTime = latest.createdAt
+                )
+            )
+        }
+        return true
+    }
+
+    fun dismissPrefetch() {
+        _prefetchState.value = _prefetchState.value.copy(skipped = true)
     }
 
     fun refreshFriends() {
@@ -667,5 +836,14 @@ class HomeViewModel : ViewModel() {
     companion object {
         /** ALIGN-12：会话列表刷新合并窗口（毫秒）。消息成串到达时合并成一次重组。 */
         private const val RECENT_CHATS_MERGE_MS = 220L
+
+        /** 首次预取：每个会话最多拉多少条历史（少量即可，目的是让列表有内容） */
+        private const val PREFETCH_MESSAGES_PER_CHAT = 10
+
+        /** 首次预取：最多处理多少个会话（有界，避免触发服务端反滥用） */
+        private const val PREFETCH_MAX_CHATS = 30
+
+        /** 首次预取并发上限 */
+        private const val PREFETCH_CONCURRENCY = 4
     }
 }

@@ -2,6 +2,7 @@ package com.oldchat.material.ui.screen
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.*
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
@@ -18,6 +19,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
 import com.oldchat.material.feature.chat.ChatScreen
+import com.oldchat.material.feature.settings.FullSettingsScreen
 import com.oldchat.material.feature.chat.ChatsScreen
 import com.oldchat.material.feature.chat.GroupChatScreen
 import com.oldchat.material.feature.discover.CheckinScreen
@@ -56,6 +58,40 @@ data class BottomNavItem(
 /** A sub-page currently being shown (either a discover route or a chat). */
 private data class SubRoute(val kind: String, val id: String, val name: String, val avatar: String? = null)
 
+private const val SCREEN_SETTINGS = "settings"
+private const val SCREEN_NOTIFICATIONS = "notifications"
+
+/**
+ * 统一页面过渡：
+ *   · 进入更深一层（tab → 设置/通知）→ 从右滑入 + 淡入，旧页轻微左移淡出
+ *   · 返回（设置/通知 → tab）→ 从左滑入 + 淡入，旧页向右滑出
+ *   · 同级 Tab 之间 → 按 Tab 序号方向轻微横移 + 淡入淡出（不会全屏横飞）
+ */
+private fun AnimatedContentTransitionScope<String>.appScreenTransition(): ContentTransform {
+    val from = initialState
+    val to = targetState
+    val fromDepth = if (from.startsWith("tab:")) 0 else 1
+    val toDepth = if (to.startsWith("tab:")) 0 else 1
+
+    return when {
+        toDepth > fromDepth ->
+            (slideInHorizontally(initialOffsetX = { it }) + fadeIn(tween(260))) togetherWith
+                (slideOutHorizontally(targetOffsetX = { -it / 5 }) + fadeOut(tween(180)))
+
+        toDepth < fromDepth ->
+            (slideInHorizontally(initialOffsetX = { -it / 5 }) + fadeIn(tween(220))) togetherWith
+                (slideOutHorizontally(targetOffsetX = { it }) + fadeOut(tween(240)))
+
+        else -> {
+            val fromTab = from.removePrefix("tab:").toIntOrNull() ?: 0
+            val toTab = to.removePrefix("tab:").toIntOrNull() ?: 0
+            val dir = if (toTab >= fromTab) 1 else -1
+            (slideInHorizontally(initialOffsetX = { dir * it / 5 }) + fadeIn(tween(220))) togetherWith
+                (slideOutHorizontally(targetOffsetX = { -dir * it / 5 }) + fadeOut(tween(180)))
+        }
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen(
@@ -75,6 +111,8 @@ fun MainScreen(
     var chatRoute by remember { mutableStateOf<SubRoute?>(null) }
     // 系统通知子页面开关
     var showNotifications by remember { mutableStateOf(false) }
+    // 设置：作为**独立整页**（不再嵌在「我的」tab 内，避免顶栏套顶栏）
+    var showSettings by remember { mutableStateOf(false) }
     // 从聊天音乐消息/音乐通知跳转到音乐广场时要播放的歌名
     var pendingMusicTitle by remember { mutableStateOf<String?>(null) }
 
@@ -109,12 +147,16 @@ fun MainScreen(
 
     fun goBack() {
         if (chatRoute != null) chatRoute = null
+        else if (showSettings) showSettings = false
         else if (discoverRoute != null) discoverRoute = null
         else if (showNotifications) showNotifications = false
     }
 
     // Intercept system back to return to previous level first.
-    BackHandler(enabled = chatRoute != null || discoverRoute != null || showNotifications) {
+    BackHandler(
+        enabled = chatRoute != null || discoverRoute != null ||
+            showNotifications || showSettings
+    ) {
         goBack()
     }
 
@@ -130,7 +172,7 @@ fun MainScreen(
 
     Scaffold(
         topBar = {
-            if (chatRoute == null && discoverRoute == null && !showNotifications) {
+            if (chatRoute == null && discoverRoute == null && !showNotifications && !showSettings) {
                 TopAppBar(
                     title = {
                         val titleText = when (selectedTab) {
@@ -160,7 +202,7 @@ fun MainScreen(
             }
         },
         bottomBar = {
-            if (chatRoute == null && discoverRoute == null && !showNotifications) {
+            if (chatRoute == null && discoverRoute == null && !showNotifications && !showSettings) {
                 NavigationBar {
                     navItems.forEachIndexed { index, item ->
                         NavigationBarItem(
@@ -175,13 +217,6 @@ fun MainScreen(
         }
     ) { innerPadding ->
         when {
-            // 系统通知子页面
-            showNotifications -> {
-                NotificationsScreen(
-                    onBack = { showNotifications = false },
-                    viewModel = notificationsViewModel
-                )
-            }
             // Chat detail is open — show it above everything.
             chatRoute != null -> {
                 AnimatedContent(
@@ -221,8 +256,29 @@ fun MainScreen(
                     }
                 }
             }
-            // Otherwise show the selected tab.
-            else -> when (selectedTab) {
+            // 其余界面（Tab / 设置 / 通知中心）共用一个方向感知的 AnimatedContent：
+            // 进入子页从右滑入、返回向右滑出、同级 Tab 之间按方向轻微横移 + 淡入淡出。
+            else -> {
+                val screenKey = when {
+                    showSettings -> SCREEN_SETTINGS
+                    showNotifications -> SCREEN_NOTIFICATIONS
+                    else -> "tab:$selectedTab"
+                }
+                AnimatedContent(
+                    targetState = screenKey,
+                    transitionSpec = { appScreenTransition() },
+                    label = "app_nav"
+                ) { key ->
+                    when {
+                        key == SCREEN_SETTINGS -> FullSettingsScreen(
+                            onBack = { showSettings = false },
+                            onLogout = onLogout
+                        )
+                        key == SCREEN_NOTIFICATIONS -> NotificationsScreen(
+                            onBack = { showNotifications = false },
+                            viewModel = notificationsViewModel
+                        )
+                        else -> when (key.removePrefix("tab:").toIntOrNull() ?: 0) {
                 0 -> ChatsScreen(
                     modifier = Modifier.padding(innerPadding),
                     onOpenChat = { id, name, avatar -> chatRoute = SubRoute("direct", id, name, avatar) },
@@ -275,8 +331,15 @@ fun MainScreen(
                         }
                     }
                 }
-                3 -> ProfileScreen(modifier = Modifier.padding(innerPadding), onLogout = onLogout)
-            }
+                3 -> ProfileScreen(
+                    modifier = Modifier.padding(innerPadding),
+                    onLogout = onLogout,
+                    onOpenSettings = { showSettings = true }
+                )
+                        }   // 关闭 tab when
+                    }       // 关闭 key when
+                }           // 关闭 AnimatedContent
+            }               // 关闭 else
         }
     }
 

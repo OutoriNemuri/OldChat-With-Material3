@@ -148,6 +148,33 @@ class MessageHistoryCache(
     // ---- Lifecycle ----
 
     /**
+     * 细分统计：每个会话一条（key / 消息条数 / 占用字节），供缓存管理子页面使用。
+     * key 形如 `direct_<uid>` 或 `group_<gid>`。
+     */
+    data class EntryStat(val key: String, val messages: Int, val bytes: Long)
+
+    fun entries(): List<EntryStat> {
+        val out = mutableListOf<EntryStat>()
+        prefs.all.forEach { (k, v) ->
+            if (k.endsWith("_ts")) return@forEach
+            val json = v as? String ?: return@forEach
+            val count = try {
+                val type = object : TypeToken<List<Any>>() {}.type
+                (gson.fromJson<List<Any>>(json, type) ?: emptyList()).size
+            } catch (_: Exception) {
+                0
+            }
+            out += EntryStat(key = k, messages = count, bytes = json.toByteArray().size.toLong())
+        }
+        return out
+    }
+
+    /** 按 key 清理单个会话的消息缓存（缓存管理子页面用） */
+    fun clearByKey(key: String) {
+        prefs.edit().remove(key).apply()
+    }
+
+    /**
      * Pause saves during scrolling.
      * Saves are held; resumeSave will flush the latest snapshot.
      */

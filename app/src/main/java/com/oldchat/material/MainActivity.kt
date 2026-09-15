@@ -119,6 +119,10 @@ class MainActivity : ComponentActivity() {
         super.onStart()
         // BUG-09 / ALIGN-06：前台标记，避免给「正在看的会话」重复弹通知
         AppForeground.isForeground = true
+        // 回到前台立刻补一次消息兜底拉取（不必等轮询周期）
+        runCatching {
+            (application as OldChatApplication).messageReceiver.pollNow()
+        }
     }
 
     override fun onStop() {

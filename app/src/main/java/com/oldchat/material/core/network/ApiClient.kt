@@ -210,8 +210,13 @@ class ApiClient(
                 }
                 bodyText = null
             } else if (response.status.value == 400) {
-                // 明确的参数类错误：原样返回错误体，不做任何重试
-                return Result.success(bodyText ?: "")
+                // 参数类错误：**按失败返回**（不要伪装成成功）。
+                // 这一点很关键：调用方（如历史分页）依赖 onFailure 走 legacy 回退，
+                // 之前把 400 当成功返回 → 解析出空列表 → 直接判定「没有更多」，
+                // 表现为「旧消息再也拉不出来」。
+                return Result.failure(
+                    ApiHttpException(response.status.value, bodyText ?: "")
+                )
             } else {
                 bodyText = null
             }
@@ -241,7 +246,12 @@ class ApiClient(
             } catch (_: Exception) { /* ignore */ }
         }
 
-        // Success
+        // Success（4xx/5xx 一律返回失败：让调用方能走回退/提示，而不是把错误体当数据解析）
+        val finalCode = response.status.value
+        if (finalCode >= 400) {
+            val errBody = bodyText ?: runCatching { response.bodyAsText() }.getOrNull() ?: ""
+            return Result.failure(ApiHttpException(finalCode, errBody))
+        }
         bodyText?.let { return Result.success(it) }
         return try {
             Result.success(response.bodyAsText())
@@ -546,6 +556,16 @@ class ApiClient(
  * Exception for auth-related errors.
  */
 class AuthException(message: String) : Exception(message)
+
+/**
+ * HTTP 层错误（4xx/5xx）。
+ *
+ * 为什么需要它：把「HTTP 失败」和「解析失败」区分开 —— 调用方（如历史分页）必须能
+ * 通过 `onFailure` 触发回退逻辑（legacy 分页、候选线路、错误提示），
+ * 而不是拿到一个错误体当成正常数据去解析。
+ */
+class ApiHttpException(val code: Int, val body: String) :
+    Exception("HTTP $code${if (body.isBlank()) "" else ": " + body.take(160)}")
 
 /**
  * Form part data for multipart requests.

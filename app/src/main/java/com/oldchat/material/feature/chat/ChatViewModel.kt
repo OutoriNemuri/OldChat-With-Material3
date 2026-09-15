@@ -49,11 +49,6 @@ class ChatViewModel : ViewModel() {
     private var markReadJob: Job? = null
     private var lastReadRequestAt: Long = 0L
 
-    // ALIGN-13：历史分页状态（注意：本类已有同名 isLoadingMore 用于旧分页逻辑，
-    // 故这里必须用不同名字，否则 Conflicting declarations）
-    private var isLoadingMoreHistory = false
-    private var historyHasMore = true
-    private var loadedPages = 1
     private val receiptRefreshTrigger = MutableSharedFlow<Unit>(
         extraBufferCapacity = 8,
         onBufferOverflow = BufferOverflow.DROP_OLDEST
@@ -259,8 +254,9 @@ class ChatViewModel : ViewModel() {
 
     /** 会话页回到前台时调用（对齐 §15：onPause 停监听 / onResume 补一次）。 */
     fun onScreenResumed() {
-        // ALIGN-14 / ALIGN-13：回前台时补一次增量（不整页重拉），并允许继续分页
-        historyHasMore = true
+        // ALIGN-14：回前台补一次回执刷新；同时立刻触发一次消息兜底轮询，
+        // 避免「WS 连着但不推」时消息要等下一个轮询周期（原先最长 30s）
+        app.messageReceiver.pollNow()
         triggerReceiptRefresh()
     }
 
@@ -918,43 +914,14 @@ class ChatViewModel : ViewModel() {
     /**
      * ALIGN-13：向上翻页加载更早历史（进入会话只拉最新一页）。
      */
+    /**
+     * 向上翻页：直接复用**原本可用**的 [loadHistory]（游标 before_id/before_created_at + offset 兜底）。
+     *
+     * 之前这里自己发明了 `before_msg_id`/`before_seq` 两个参数 —— 服务端并不认，
+     * 返回 400（而 400 的响应体被当成空列表解析）→ 结果是「旧消息再也拉不出来」。
+     */
     fun loadMoreHistory() {
-        if (isLoadingMoreHistory || !historyHasMore) return
-        val oldest = _messages.value.minByOrNull { it.createdAt } ?: return
-        isLoadingMoreHistory = true
-        viewModelScope.launch {
-            try {
-                if (loadedPages >= MAX_HISTORY_PAGES) {
-                    historyHasMore = false
-                    return@launch
-                }
-                val params = mutableMapOf(
-                    "with_uid" to friendUid,
-                    "limit" to HISTORY_PAGE_SIZE.toString()
-                )
-                // 游标：优先用服务端认可的消息 id，其次用序号
-                if (oldest.id.isNotEmpty() && !oldest.isLocalPending) {
-                    params["before_msg_id"] = oldest.id
-                }
-                params["before_seq"] = oldest.sortSeq.toString()
-
-                apiClient.get("/direct/messages/v2", params).onSuccess { body ->
-                    val older = parseMessages(body)
-                    if (older.isEmpty()) {
-                        historyHasMore = false
-                    } else {
-                        loadedPages += 1
-                        mergeMessages(older, appendToFront = true)
-                        historyHasMore = older.size >= HISTORY_PAGE_SIZE &&
-                            loadedPages < MAX_HISTORY_PAGES
-                    }
-                }
-            } catch (_: Exception) {
-                historyHasMore = false
-            } finally {
-                isLoadingMoreHistory = false
-            }
-        }
+        loadHistory()
     }
 
     /**
@@ -1073,8 +1040,5 @@ class ChatViewModel : ViewModel() {
         const val TYPING_THROTTLE_MS = 2_500L
         const val TYPING_TIMEOUT_MS = 6_000L
 
-        /** ALIGN-13：历史分页页大小与最大页数（对齐 §3.1「最多 150 条」） */
-        const val HISTORY_PAGE_SIZE = 30
-        const val MAX_HISTORY_PAGES = 5
     }
 }

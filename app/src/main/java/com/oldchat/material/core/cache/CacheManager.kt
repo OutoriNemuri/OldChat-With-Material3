@@ -149,6 +149,131 @@ class CacheManager(context: Context) {
     )
 
     /**
+     * 细分缓存条目：缓存管理子页面用（比 [CacheGroup] 更精确，带可清理标记与条数）。
+     */
+    data class CacheSection(
+        val key: String,
+        val title: String,
+        val description: String,
+        val bytes: Long,
+        val itemCount: Int,
+        /** false = 不建议清理（例如登录态） */
+        val clearable: Boolean = true
+    )
+
+    /** 单个会话的消息缓存（缓存管理子页面里按会话逐个清理） */
+    data class ConversationCache(
+        val key: String,
+        val chatId: String,
+        val type: String,       // direct / group
+        val title: String,
+        val messages: Int,
+        val bytes: Long
+    )
+
+    /**
+     * 细分缓存清单（缓存管理子页面的数据源）。
+     * 每项都可单独清理，消息历史还会在界面里展开成「按会话」列表。
+     */
+    fun listSections(context: Context): List<CacheSection> {
+        val spDir = File(context.applicationInfo.dataDir, "shared_prefs")
+        val sections = mutableListOf<CacheSection>()
+
+        val historyEntries = messageHistory.entries()
+        sections += CacheSection(
+            key = "messages",
+            title = "消息历史",
+            description = "每个会话最近若干条消息（本地明文缓存）",
+            bytes = historyEntries.sumOf { it.bytes },
+            itemCount = historyEntries.sumOf { it.messages }
+        )
+        sections += CacheSection(
+            key = "recent_chats",
+            title = "会话列表",
+            description = "会话预览、未读计数、置顶/免打扰状态",
+            bytes = fileSizeOf(spDir, "recent_chat_cache.xml"),
+            itemCount = recentChats.getAll().size
+        )
+        sections += CacheSection(
+            key = "friends_groups",
+            title = "好友 / 群",
+            description = "通讯录与群资料（清除后下次进入会重新拉取）",
+            bytes = fileSizeOf(spDir, "friend_cache.xml") + fileSizeOf(spDir, "group_cache.xml"),
+            itemCount = friends.getAll().size + groups.getAll().size
+        )
+        sections += CacheSection(
+            key = "images",
+            title = "图片缓存",
+            description = "Coil 磁盘缓存（图片、头像、表情）",
+            bytes = dirSizeRecursive(File(context.cacheDir, "image_cache")),
+            itemCount = -1
+        )
+        sections += CacheSection(
+            key = "voice",
+            title = "语音 / 临时文件",
+            description = "录音与上传前临时文件",
+            bytes = voiceTempBytes(context),
+            itemCount = -1
+        )
+        sections += CacheSection(
+            key = "page",
+            title = "页面数据",
+            description = "公开法庭 / 音乐广场等页面的 JSON 缓存",
+            bytes = fileSizeOf(spDir, "page_json_cache.xml"),
+            itemCount = -1
+        )
+        sections += CacheSection(
+            key = "emoji",
+            title = "我的表情",
+            description = "本地表情贴纸",
+            bytes = fileSizeOf(spDir, "emoji_store.xml"),
+            itemCount = -1
+        )
+        return sections
+    }
+
+    /** 清空单个细分缓存 */
+    fun clearSection(context: Context, key: String) {
+        when (key) {
+            "messages" -> messageHistory.clearAll()
+            "recent_chats" -> recentChats.clearAll()
+            "friends_groups" -> {
+                friends.clear()
+                groups.clear()
+            }
+            "images" -> deleteDirRecursive(File(context.cacheDir, "image_cache"))
+            "voice" -> {
+                File(context.cacheDir).listFiles()
+                    ?.filter { it.isFile && (it.name.startsWith("voice_") || it.name.endsWith(".tmp")) }
+                    ?.forEach { it.delete() }
+            }
+            "page" -> pageCache.clearAll()
+            "emoji" -> emojiStore.clearAll()
+        }
+    }
+
+    /** 按会话列出消息缓存（用于「更精准」的清理） */
+    fun listConversationCaches(): List<ConversationCache> =
+        messageHistory.entries().map { entry ->
+            val id = entry.key.removePrefix("direct_").removePrefix("group_")
+            val type = if (entry.key.startsWith("group_")) "group" else "direct"
+            val title = recentChats.getByChatId(id)?.name
+                ?: if (type == "group") groups.get(id)?.name else friends.get(id)?.nickname
+                ?: id
+            ConversationCache(
+                key = entry.key,
+                chatId = id,
+                type = type,
+                title = title,
+                messages = entry.messages,
+                bytes = entry.bytes
+            )
+        }.sortedByDescending { it.bytes }
+
+    /** 清空某个会话的消息缓存 */
+    fun clearConversation(key: String) = messageHistory.clearByKey(key)
+
+    /**
      * 计算全部缓存占用分组。既包含 SharedPreferences 内的业务缓存文件，
      * 也包含 Coil 图片磁盘缓存与录音/临时文件。
      *

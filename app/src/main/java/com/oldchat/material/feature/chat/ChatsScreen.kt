@@ -61,6 +61,30 @@ fun ChatsScreen(
         homeViewModel.loadProfile()
     }
 
+    // 首次使用（本机没有缓存）→ 引导一次性拉取基础数据进缓存
+    var showPrefetchDialog by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        if (!homeViewModel.hasBasicCache()) showPrefetchDialog = true
+    }
+    val prefetchState by homeViewModel.prefetchState.collectAsStateWithLifecycle()
+    if (showPrefetchDialog) {
+        PrefetchGuideDialog(
+            state = prefetchState,
+            onStart = { homeViewModel.prefetchBasics() },
+            onDismiss = {
+                homeViewModel.dismissPrefetch()
+                showPrefetchDialog = false
+            }
+        )
+        // 预取完成 → 自动收起
+        LaunchedEffect(prefetchState.finished) {
+            if (prefetchState.finished) {
+                kotlinx.coroutines.delay(1200)
+                showPrefetchDialog = false
+            }
+        }
+    }
+
     LazyColumn(
         modifier = modifier.fillMaxSize(),
         contentPadding = PaddingValues(vertical = 8.dp)

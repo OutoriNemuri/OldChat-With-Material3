@@ -50,6 +50,8 @@ private enum class ProfileRoute { EDIT_PROFILE, MY_SPACE, FAVORITES, SETTINGS }
 fun ProfileScreen(
     modifier: Modifier = Modifier,
     onLogout: () -> Unit = {},
+    /** 设置页由 MainScreen 作为**独立整页**打开（不再嵌在本 tab 内） */
+    onOpenSettings: () -> Unit = {},
     homeViewModel: HomeViewModel = viewModel()
 ) {
     var profileRoute by remember { mutableStateOf<ProfileRoute?>(null) }
@@ -77,10 +79,13 @@ fun ProfileScreen(
             ProfileRoute.EDIT_PROFILE -> EditProfileScreen(onBack = { profileRoute = null })
             ProfileRoute.MY_SPACE -> MySpaceScreen(onBack = { profileRoute = null })
             ProfileRoute.FAVORITES -> FavoritesScreen(onBack = { profileRoute = null })
-            ProfileRoute.SETTINGS -> FullSettingsScreen(
-                onBack = { profileRoute = null },
-                onLogout = onLogout
-            )
+            // 设置不再是本页子路由：交给 MainScreen 以独立整页打开
+            ProfileRoute.SETTINGS -> {
+                LaunchedEffect(Unit) {
+                    profileRoute = null
+                    onOpenSettings()
+                }
+            }
             null -> ProfileMainScreen(
                 homeViewModel = homeViewModel,
                 onNavigate = { profileRoute = it },
